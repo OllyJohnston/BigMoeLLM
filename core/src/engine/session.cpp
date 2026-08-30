@@ -585,19 +585,21 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
 
     std::vector<std::string> buft_override_patterns;
     std::vector<llama_model_tensor_buft_override> buft_overrides;
-    if (mparams.n_gpu_layers > 0 && (cfg.moe.enabled || cfg.moe.cpu_moe)) {
-        const int n_pinned = cfg.moe.n_pinned_layers;
-#if defined(BMOE_HAVE_CUDA)
-        ggml_backend_buffer_type_t target_buft = get_dummy_cuda_buft();
-#else
-        ggml_backend_buffer_type_t target_buft = ggml_backend_cpu_buffer_type();
-#endif
-        for (int il = n_pinned; il < 256; ++il) {
-            buft_override_patterns.push_back("blk\\." + std::to_string(il) + "\\.ffn_.*exps.*");
+    if (mparams.n_gpu_layers > 0) {
+        // Always keep the massive N-gram embedding table on host mmap/CPU buffer
+        buft_override_patterns.push_back("per_layer_token_embd.*");
+        buft_override_patterns.push_back(".*ple.*");
+        buft_override_patterns.push_back(".*token_embd_ngram.*");
+
+        if (cfg.moe.enabled || cfg.moe.cpu_moe) {
+            const int n_pinned = cfg.moe.n_pinned_layers;
+            for (int il = n_pinned; il < 256; ++il) {
+                buft_override_patterns.push_back("blk\\." + std::to_string(il) + "\\.ffn_.*exps.*");
+            }
         }
 
         for (const auto & pat : buft_override_patterns) {
-            buft_overrides.push_back({ pat.c_str(), target_buft });
+            buft_overrides.push_back({ pat.c_str(), ggml_backend_cpu_buffer_type() });
         }
         buft_overrides.push_back({ nullptr, nullptr });
         mparams.tensor_buft_overrides = buft_overrides.data();
