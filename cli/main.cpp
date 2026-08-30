@@ -357,7 +357,9 @@ static void print_usage(const char * argv0) {
         "  -p, --prompt STR        prompt text\n"
         "  -n, --n-predict N       tokens to generate (default 128)\n"
         "  -t, --threads N         compute threads (default 4)\n"
+        "  -ngl, --n-gpu-layers N  number of layers to offload to GPU (default 0)\n"
         "  -c, --ctx-size N        context size (default 2048)\n"
+        "\n"
         "      --ubatch N          widest graph computed at once (0 = as wide as the context).\n"
         "                          Compute buffers are reserved for it, so a smaller value hands\n"
         "                          RAM back to the expert cache at the cost of prefill speed;\n"
@@ -560,8 +562,11 @@ int main(int argc, char ** argv) {
             cfg.n_predict = std::atoi(next("-n"));
         else if (a == "-t" || a == "--threads")
             cfg.n_threads = std::atoi(next("-t"));
+        else if (a == "-ngl" || a == "--n-gpu-layers")
+            cfg.n_gpu_layers = std::atoi(next("-ngl"));
         else if (a == "-c" || a == "--ctx-size")
             cfg.n_ctx = std::atoi(next("-c"));
+
         else if (a == "--ubatch")
             cfg.n_ubatch = std::atoi(next("--ubatch"));
         else if (a == "--n-expert-used")
@@ -572,6 +577,28 @@ int main(int argc, char ** argv) {
             cfg.sampling.top_k = std::atoi(next("--top-k"));
         else if (a == "--top-p")
             cfg.sampling.top_p = (float) std::atof(next("--top-p"));
+        else if (a == "--min-p")
+            cfg.sampling.min_p = (float) std::atof(next("--min-p"));
+        else if (a == "--repeat-penalty" || a == "--penalty-repeat")
+            cfg.sampling.repeat_penalty = (float) std::atof(next(a.c_str()));
+        else if (a == "--presence-penalty" || a == "--penalty-present")
+            cfg.sampling.presence_penalty = (float) std::atof(next(a.c_str()));
+        else if (a == "--frequency-penalty" || a == "--penalty-freq")
+            cfg.sampling.frequency_penalty = (float) std::atof(next(a.c_str()));
+        else if (a == "--repeat-last-n" || a == "--penalty-last-n")
+            cfg.sampling.repeat_last_n = std::atoi(next(a.c_str()));
+        else if (a == "--cpu-moe")
+            cfg.moe.cpu_moe = true;
+        else if (a == "--n-cpu-moe") {
+            cfg.moe.cpu_moe = true;
+            // e.g. --n-cpu-moe 28
+        } else if (a == "--load-mode") {
+            std::string lm = next("--load-mode");
+            if (lm == "mmap") {
+                cfg.moe.cpu_moe = true;
+                cfg.moe.dense_weights = bmoe::DenseWeightsMode::Mmap;
+            }
+        }
         else if (a == "--seed")
             cfg.sampling.seed = (uint32_t) std::strtoul(next("--seed"), nullptr, 10);
         else if (a == "--mtp" || a == "--ngram") {
@@ -590,6 +617,16 @@ int main(int argc, char ** argv) {
             cfg.spec.draft_p_min = (float) std::atof(next("--mtp-p-min"));
         else if (a == "--ngram-min-match")
             cfg.spec.ngram_min_match = std::atoi(next("--ngram-min-match"));
+        else if (a == "-ctk" || a == "--cache-type-k")
+            cfg.cache_type_k = next("-ctk");
+
+
+        else if (a == "-ctv" || a == "--cache-type-v")
+            cfg.cache_type_v = next("-ctv");
+        else if (a == "-fa" || a == "--flash-attn")
+            cfg.flash_attn = true;
+        else if (a == "--no-flash-attn" || a == "--no-fa")
+            cfg.flash_attn = false;
         else if (a == "--chatml")
             cfg.chatml = true;
         else if (a == "--no-think")
@@ -598,6 +635,7 @@ int main(int argc, char ** argv) {
             cfg.progress = true;
         else if (a == "--session")
             session_mode = true;
+
         else if (a == "--csv")
             csv_path = next("--csv");
         else if (a == "--route-trace")
@@ -625,7 +663,10 @@ int main(int argc, char ** argv) {
             cfg.moe.io_threads = std::atoi(next("--io-threads"));
         else if (a == "--no-odirect")
             cfg.moe.o_direct = false;
+        else if (a == "--n-pinned-layers" || a == "--pinned-layers")
+            cfg.moe.n_pinned_layers = std::atoi(next(a.c_str()));
         else if (a == "--dense-weights") {
+
             const std::string m = next("--dense-weights");
             if (m == "mmap")
                 cfg.moe.dense_weights = bmoe::DenseWeightsMode::Mmap;
@@ -672,7 +713,15 @@ int main(int argc, char ** argv) {
             cfg.moe.predict_prefetch = true;
         else if (a == "--predict-spec-max")
             cfg.moe.predict_spec_max = std::atoi(next("--predict-spec-max"));
+        else if (a == "--no-cg" || a == "--no-cuda-graphs") {
+#if defined(_WIN32)
+            _putenv("GGML_CUDA_DISABLE_GRAPHS=1");
+#else
+            setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+#endif
+        }
         else if (a == "--list-archs") {
+
             std::printf("supported MoE architectures:\n");
             for (int k = 0; k < n_moe_recipes(); ++k)
                 std::printf("  %s\n", moe_recipe_at(k)->arch);

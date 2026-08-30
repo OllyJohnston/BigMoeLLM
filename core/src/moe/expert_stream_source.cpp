@@ -1,9 +1,11 @@
 #include "expert_stream_source.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #ifdef BMOE_HAVE_EXPERT_READY_HOOK
 #include "ggml-cpu.h" // ggml_cpu_set_expert_ready_hook (fork-only)
 #endif
+
 
 #include <algorithm>
 #include <chrono>
@@ -125,6 +127,49 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         }
     }
 
+#if defined(BMOE_HAVE_CUDA)
+    cuda_staging_enabled_ = false;
+    for (const LayerExperts & L : layers_) {
+        if (!L.bound) continue;
+        for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+            if (L.proj[p].tensor && L.proj[p].tensor->buffer && !ggml_backend_buffer_is_host(L.proj[p].tensor->buffer)) {
+                cuda_staging_enabled_ = true;
+                break;
+            }
+        }
+        if (cuda_staging_enabled_) break;
+    }
+    if (cuda_staging_enabled_) {
+        std::vector<size_t> layer_sizes((size_t) n_layer_, 0);
+        size_t max_layer_bytes = 0;
+        for (int il = 0; il < n_layer_; ++il) {
+            const LayerExperts & L = layers_[il];
+            if (!L.bound) continue;
+            size_t layer_sz = 0;
+            for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                if (L.proj[p].tensor) {
+                    size_t proj_bytes = (size_t) ((uint64_t) n_expert_ * L.proj[p].nb2);
+                    layer_sz += (proj_bytes + 255ull) & ~255ull;
+                }
+            }
+            layer_sizes[il] = layer_sz;
+            if (layer_sz > max_layer_bytes) max_layer_bytes = layer_sz;
+        }
+        // Round slot capacity up to 1 MiB boundary, with minimum 512 MiB
+        size_t slot_cap = (max_layer_bytes + 1024ull * 1024ull - 1ull) & ~(1024ull * 1024ull - 1ull);
+        if (slot_cap < 512ull * 1024ull * 1024ull) slot_cap = 512ull * 1024ull * 1024ull;
+        const int n_slots = 4;
+        size_t arena_sz = slot_cap * (size_t) n_slots;
+        cuda_stager_.init(arena_sz, n_slots);
+        std::fprintf(stderr, "bmoe: dual-stream CUDA VRAM staging enabled (%zu MiB arena, %d slots of %zu MiB)\n",
+                     arena_sz / (1024 * 1024), n_slots, slot_cap / (1024 * 1024));
+
+        if (cfg.n_pinned_layers > 0) {
+            cuda_stager_.set_pinned_layers(cfg.n_pinned_layers);
+        }
+    }
+#endif
+
     if (cache_max_ == 0) {
         // One shared slot per present projection, reused across layers (one layer computes
         // at a time). Rebind every bound layer's expert tensors onto them; only routed
@@ -137,10 +182,15 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
                 return false;
             }
         }
-        for (LayerExperts & L : layers_) {
+        for (int il = 0; il < (int) layers_.size(); ++il) {
+            LayerExperts & L = layers_[il];
             if (!L.bound) continue;
-            for (int p = 0; p < MoeRecipe::max_exps; ++p)
-                if (L.proj[p].tensor) L.proj[p].tensor->data = slot_[p];
+            if (cuda_stager_.is_layer_pinned(il)) continue;
+            for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                if (L.proj[p].tensor) {
+                    L.proj[p].tensor->data = cuda_staging_enabled_ ? cuda_stager_.vram_arena_ptr() : slot_[p];
+                }
+            }
         }
     } else {
         // LRU cache: one reserved (address-only) buffer per (layer, projection). Physical
@@ -155,6 +205,7 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         for (int il = 0; il < n_layer_; ++il) {
             LayerExperts & L = layers_[il];
             if (!L.bound) continue;
+            if (cuda_stager_.is_layer_pinned(il)) continue;
             for (int p = 0; p < MoeRecipe::max_exps; ++p) {
                 if (!L.proj[p].tensor) continue; // absent slot in a fused layout
                 const size_t full = (size_t) L.proj[p].nb2 * (size_t) n_expert_;
@@ -164,13 +215,14 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
                     return false;
                 }
                 lbuf_sz_[p][il] = full;
-                L.proj[p].tensor->data = lbuf_[p][il];
+                L.proj[p].tensor->data = cuda_staging_enabled_ ? cuda_stager_.vram_arena_ptr() : lbuf_[p][il];
             }
         }
         const size_t n_entry = (size_t) n_layer_ * n_expert_;
         cvalid_.assign(n_entry, 0);
         cstamp_.assign(n_entry, 0);
         cprev_.assign(n_entry, -1);
+
         cnext_.assign(n_entry, -1);
         cspec_.assign(n_entry, 0);
         spec_remaining_.assign(n_entry, 0);
@@ -273,6 +325,7 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
                  n_expert_, (int) all_direct, io_threads_, cache_max_ >> 20, readers_.size());
     return true;
 }
+
 
 // ── one aligned slice read on a lane ────────────────────────────────────────────────
 // The bytes come from the reader; this wraps it with the domain the reader must not know about — the
@@ -935,9 +988,13 @@ bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, in
 // ── load: stage routed experts, read the batch, evict cold entries to budget ────────
 bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
     if (!active_ || il < 0 || il >= n_layer_ || !layers_[il].bound || !ids || n_ids <= 0) return false;
+#if defined(BMOE_HAVE_CUDA)
+    if (cuda_staging_enabled_ && cuda_stager_.is_layer_pinned(il)) return true;
+#endif
     if (overlap_) return load_layer_async(il, ids, n_ids);
     LayerExperts & L = layers_[il];
     cgen_++;
+
     jobs_.clear();
 
     // Cache-management work (vm commit + LRU bookkeeping, then eviction below) is timed into
@@ -1044,8 +1101,36 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
         mgmt_ns_.fetch_add(
             (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - te0).count());
     }
+
+#if defined(BMOE_HAVE_CUDA)
+    if (cuda_staging_enabled_) {
+        std::vector<ExpertStagingItem> items;
+        items.reserve((size_t) n_unique * MoeRecipe::max_exps);
+        size_t proj_offset = 0;
+        for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+            if (!L.proj[p].tensor) continue;
+            const uint64_t slice = L.proj[p].nb2;
+            if (slice == 0) continue;
+            for (int e = 0; e < n_expert_; ++e) {
+                if (!seen_[e]) continue;
+                const char * h_src = (cache_max_ == 0)
+                                         ? (const char *) slot_[p] + (uint64_t) e * slice
+                                         : (const char *) lbuf_[p][il] + (uint64_t) e * slice;
+                size_t offset_in_slot = proj_offset + (size_t) ((uint64_t) e * slice);
+                items.push_back({h_src, offset_in_slot, (size_t) slice});
+            }
+            size_t total_proj_bytes = (size_t) ((uint64_t) n_expert_ * slice);
+            proj_offset += (total_proj_bytes + 255ull) & ~255ull;
+        }
+        if (!items.empty()) {
+            cuda_stager_.stage_layer_async(il, items);
+        }
+    }
+#endif
+
     return true;
 }
+
 
 // ── overlap load: publish the routed reads, mark readiness, return without waiting ──────
 //
@@ -1056,7 +1141,11 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
 // order it blocks on them, minimising stalls. Correctness does not depend on the order — the
 // readiness flags gate each expert regardless — only latency does.
 bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids) {
+#if defined(BMOE_HAVE_CUDA)
+    if (cuda_staging_enabled_ && cuda_stager_.is_layer_pinned(il)) return true;
+#endif
     LayerExperts & L = layers_[il];
+
 
     // 1. Drain the previous batch fully before reusing jobs_/the flags. This is the eviction
     //    safety guarantee (no worker still reading an about-to-be-evicted page) and it covers
@@ -1256,13 +1345,36 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
     // 5. Evict cold entries to budget. Safe to run concurrently with this batch's reads: step 1
     //    guaranteed no stale in-flight jobs, and current-gen entries (cstamp_ == cgen_) — the
     //    ones just staged — are never chosen, so eviction only releases pages nobody is reading.
-    if (cache_max_) {
-        while (cresident_ > cache_max_ && ctail_ != -1 && cstamp_[ctail_] != cgen_)
-            evict_tail();
-    }
     mgmt_ns_.fetch_add((long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - tm0).count());
+
+#if defined(BMOE_HAVE_CUDA)
+    if (cuda_staging_enabled_) {
+        std::vector<ExpertStagingItem> items;
+        items.reserve((size_t) staged_.size() * MoeRecipe::max_exps);
+        size_t proj_offset = 0;
+        for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+            if (!L.proj[p].tensor) continue;
+            const uint64_t slice = L.proj[p].nb2;
+            if (slice == 0) continue;
+            for (int e : staged_) {
+                const char * h_src = (cache_max_ == 0)
+                                         ? (const char *) slot_[p] + (uint64_t) e * slice
+                                         : (const char *) lbuf_[p][il] + (uint64_t) e * slice;
+                size_t offset_in_slot = proj_offset + (size_t) ((uint64_t) e * slice);
+                items.push_back({h_src, offset_in_slot, (size_t) slice});
+            }
+            size_t total_proj_bytes = (size_t) ((uint64_t) n_expert_ * slice);
+            proj_offset += (total_proj_bytes + 255ull) & ~255ull;
+        }
+        if (!items.empty()) {
+            cuda_stager_.stage_layer_async(il, items);
+        }
+    }
+#endif
+
     return true;
 }
+
 
 // Static trampoline for the process-global fork hook → member.
 void ExpertStreamSource::c_expert_ready(const ggml_tensor * src0, int expert, void * user_data) {

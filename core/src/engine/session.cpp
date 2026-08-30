@@ -13,6 +13,105 @@
 
 #include "llama.h"
 #include "ggml.h"
+#include "ggml-backend.h"
+
+#if defined(BMOE_HAVE_CUDA)
+#include <cuda_runtime.h>
+#include "ggml-cuda.h"
+#include "ggml-backend-impl.h"
+
+struct dummy_cuda_buffer_context {
+    void * d_ptr = nullptr;
+    size_t size = 0;
+};
+
+static void dummy_free_buffer(ggml_backend_buffer_t buffer) {
+    auto * ctx = (dummy_cuda_buffer_context *) buffer->context;
+    if (ctx) {
+        delete ctx;
+    }
+}
+
+static void * dummy_get_base(ggml_backend_buffer_t buffer) {
+    auto * ctx = (dummy_cuda_buffer_context *) buffer->context;
+    return ctx ? ctx->d_ptr : nullptr;
+}
+
+static enum ggml_status dummy_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
+    auto * ctx = (dummy_cuda_buffer_context *) buffer->context;
+    if (ctx && ctx->d_ptr && !tensor->data) {
+        tensor->data = ctx->d_ptr;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static void dummy_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    (void) buffer; (void) tensor; (void) value; (void) offset; (void) size;
+}
+
+static void dummy_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    (void) buffer; (void) tensor; (void) data; (void) offset; (void) size;
+}
+
+static void dummy_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    (void) buffer; (void) tensor; (void) data; (void) offset; (void) size;
+}
+
+static void dummy_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    (void) buffer; (void) value;
+}
+
+static const struct ggml_backend_buffer_i dummy_cuda_buffer_interface = {
+    /* .free_buffer   = */ dummy_free_buffer,
+    /* .get_base      = */ dummy_get_base,
+    /* .init_tensor   = */ dummy_init_tensor,
+    /* .memset_tensor = */ dummy_memset_tensor,
+    /* .set_tensor    = */ dummy_set_tensor,
+    /* .get_tensor    = */ dummy_get_tensor,
+    /* .set_tensor_2d = */ nullptr,
+    /* .get_tensor_2d = */ nullptr,
+    /* .cpy_tensor    = */ nullptr,
+    /* .clear         = */ dummy_clear,
+    /* .reset         = */ nullptr,
+};
+
+static ggml_backend_buffer_t dummy_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    (void) buft;
+    static void * s_shared_d_dummy = nullptr;
+    static size_t s_shared_d_size = 0;
+    constexpr size_t shared_cap = 640ull * 1024ull * 1024ull;
+    if (!s_shared_d_dummy) {
+        cudaMalloc(&s_shared_d_dummy, shared_cap);
+        cudaMemset(s_shared_d_dummy, 0, shared_cap);
+        s_shared_d_size = shared_cap;
+    }
+    auto * ctx = new dummy_cuda_buffer_context();
+    ctx->d_ptr = s_shared_d_dummy;
+    ctx->size = s_shared_d_size;
+    return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(0), dummy_cuda_buffer_interface, ctx, size);
+}
+
+
+static size_t dummy_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+    (void) buft;
+    (void) tensor;
+    return 256;
+}
+
+static ggml_backend_buffer_type_t get_dummy_cuda_buft() {
+    static struct ggml_backend_buffer_type dummy_buft;
+    static bool init = false;
+    if (!init) {
+        ggml_backend_buffer_type_t real_buft = ggml_backend_cuda_buffer_type(0);
+        dummy_buft = *real_buft;
+        dummy_buft.iface.alloc_buffer = dummy_buft_alloc_buffer;
+        dummy_buft.iface.get_alloc_size = dummy_buft_get_alloc_size;
+        init = true;
+    }
+    return &dummy_buft;
+}
+#endif
+
 
 // llama.cpp's `common` layer (NOT the stable public API): chat-template rendering and
 // reasoning parsing. See the note in the root CMakeLists / docs/seam.md.
@@ -36,6 +135,7 @@
 namespace bmoe {
 
 namespace {
+
 
 using clock_t_ = std::chrono::steady_clock;
 double secs(clock_t_::time_point a, clock_t_::time_point b) {
@@ -78,6 +178,46 @@ void batch_fill(llama_batch & b, const llama_token * toks, int n, llama_pos pos0
 // Raised to 1 + draft_max when a very wide draft asks for more, and clamped down to the target's own
 // ubatch so it is never the wider of the two.
 constexpr int mtp_draft_ubatch = 32;
+
+static enum ggml_type parse_kv_cache_type(const std::string & s) {
+    if (s == "q8_0" || s == "Q8_0") return GGML_TYPE_Q8_0;
+    if (s == "q4_0" || s == "Q4_0") return GGML_TYPE_Q4_0;
+    if (s == "q4_1" || s == "Q4_1") return GGML_TYPE_Q4_1;
+    if (s == "q5_0" || s == "Q5_0") return GGML_TYPE_Q5_0;
+    if (s == "q5_1" || s == "Q5_1") return GGML_TYPE_Q5_1;
+    if (s == "f32" || s == "F32") return GGML_TYPE_F32;
+    if (s == "bf16" || s == "BF16") return GGML_TYPE_BF16;
+    return GGML_TYPE_F16; // default
+}
+
+
+static llama_sampler * create_sampler_chain(const SamplingConfig & sc, int n_vocab) {
+    if (sc.temp <= 0.0f) {
+        return nullptr; // greedy / argmax
+    }
+    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (sc.repeat_penalty != 1.0f || sc.frequency_penalty != 0.0f || sc.presence_penalty != 0.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
+            n_vocab,
+            sc.repeat_last_n,
+            sc.repeat_penalty,
+            sc.frequency_penalty,
+            sc.presence_penalty
+        ));
+    }
+    if (sc.top_k > 0) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(sc.top_k));
+    }
+    if (sc.top_p > 0.0f && sc.top_p < 1.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(sc.top_p, /*min_keep*/ 1));
+    }
+    if (sc.min_p > 0.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_min_p(sc.min_p, /*min_keep*/ 1));
+    }
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(sc.temp));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(sc.seed));
+    return smpl;
+}
 
 llama_token argmax(const float * logits, int n_vocab) {
     llama_token best = 0;
@@ -409,7 +549,8 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     llama_model_params mparams = llama_model_default_params();
     mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
     mparams.use_extra_bufts = false;
-    mparams.n_gpu_layers = 0;
+    mparams.n_gpu_layers = cfg.n_gpu_layers;
+
     // The nextn/MTP block is skipped at load unless asked for: llama.cpp marks its tensors
     // TENSOR_SKIP by default, and only --mtp builds a graph over them. n_layer_nextn comes from
     // the gguf metadata either way, so the "this model has no trained head" check below is
@@ -440,7 +581,35 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         mparams.kv_overrides = kv_overrides;
     }
 
+    std::vector<std::string> buft_override_patterns;
+    std::vector<llama_model_tensor_buft_override> buft_overrides;
+    if (mparams.n_gpu_layers > 0 && (cfg.moe.enabled || cfg.moe.cpu_moe)) {
+        const int n_pinned = cfg.moe.n_pinned_layers;
+        ggml_backend_buffer_type_t target_buft = nullptr;
+        if (cfg.moe.cpu_moe) {
+            target_buft = ggml_backend_cpu_buffer_type();
+        } else {
+#if defined(BMOE_HAVE_CUDA)
+            target_buft = get_dummy_cuda_buft();
+#else
+            target_buft = ggml_backend_cpu_buffer_type();
+#endif
+        }
+        for (int il = n_pinned; il < 256; ++il) {
+            buft_override_patterns.push_back("blk\\." + std::to_string(il) + "\\.ffn_.*exps.*");
+        }
+
+        for (const auto & pat : buft_override_patterns) {
+            buft_overrides.push_back({ pat.c_str(), target_buft });
+        }
+        buft_overrides.push_back({ nullptr, nullptr });
+        mparams.tensor_buft_overrides = buft_overrides.data();
+    }
+
+
+
     llama_model * model = llama_model_load_from_file(cfg.model_path.c_str(), mparams);
+
     if (!model) return fail("failed to load model: " + cfg.model_path);
     im.model.reset(model);
 
@@ -499,6 +668,8 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = cfg.n_ctx;
     cparams.n_batch = cfg.n_batch;
+    cparams.n_threads = (uint32_t) cfg.n_threads;
+    cparams.n_threads_batch = (uint32_t) cfg.n_threads;
     // The graph is reserved for the widest ubatch, so this is what sets the resident compute
     // buffers — the memory this engine is always short of. 0 keeps the historical behaviour
     // (one graph as wide as the batch); a smaller value chunks prefill to buy that memory back.
@@ -510,15 +681,23 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         cparams.cb_eval = &RouterHook::c_eval;
         cparams.cb_eval_user_data = im.hook.get();
     }
-    // Rejecting a draft means rewinding the KV to the last accepted position. With recurrent-state
-    // snapshots the rewind is a cheap restore; without them llama.cpp has to fall back to replaying
-    // the sequence, which would hand back exactly the decode the speculation just saved.
+
+    cparams.type_k = parse_kv_cache_type(cfg.cache_type_k);
+    cparams.type_v = parse_kv_cache_type(cfg.cache_type_v);
+
+    if (cfg.flash_attn || cparams.type_v != GGML_TYPE_F16) {
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    } else {
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
     if (cfg.spec.enabled()) cparams.n_rs_seq = (uint32_t) cfg.spec.draft_max;
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) return fail("failed to create context");
     im.ctx.reset(ctx);
     llama_set_n_threads(ctx, cfg.n_threads, cfg.n_threads);
+    std::fprintf(stderr, "llama threadpool init, n_threads = %d\n", cfg.n_threads);
 
     // The MTP draft context: same model, same eval callback, but ctx_type = MTP so llama.cpp builds
     // the nextn graph. It keeps its own (single-position) KV, hence n_rs_seq = 0 — nothing is ever
@@ -551,12 +730,9 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     static_assert(SamplingConfig{}.seed == LLAMA_DEFAULT_SEED,
                   "SamplingConfig::seed default must mirror LLAMA_DEFAULT_SEED");
     if (cfg.sampling.temp > 0.0f) {
-        im.smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-        llama_sampler_chain_add(im.smpl, llama_sampler_init_top_k(cfg.sampling.top_k));
-        llama_sampler_chain_add(im.smpl, llama_sampler_init_top_p(cfg.sampling.top_p, /*min_keep*/ 1));
-        llama_sampler_chain_add(im.smpl, llama_sampler_init_temp(cfg.sampling.temp));
-        llama_sampler_chain_add(im.smpl, llama_sampler_init_dist(cfg.sampling.seed));
+        im.smpl = create_sampler_chain(cfg.sampling, im.n_vocab);
     }
+
 
     // One abort callback for the session's whole life, checking two independent predicates:
     // an explicit cancel() request (any mode) and a fatal streaming I/O error (overlap only).
@@ -887,6 +1063,15 @@ RunResult Session::generate(const GenerateRequest & req,
 
     // clear_kv = "new chat": drop the KV and the engine-held conversation. Otherwise this turn
     // continues the conversation, reusing the KV prefix already decoded from earlier turns.
+    llama_sampler * smpl_to_use = nullptr;
+    std::unique_ptr<llama_sampler, void (*)(llama_sampler *)> req_smpl(nullptr, llama_sampler_free);
+    if (req.has_sampling) {
+        smpl_to_use = create_sampler_chain(req.sampling, im.n_vocab);
+        req_smpl.reset(smpl_to_use);
+    } else {
+        smpl_to_use = im.smpl;
+    }
+
     if (req.clear_kv) {
         llama_memory_clear(llama_get_memory(ctx), true);
         // The draft context tracks the target's positions and must be dropped with it, or the first
@@ -897,8 +1082,9 @@ RunResult Session::generate(const GenerateRequest & req,
         // A new chat resets the sampler RNG, so a fixed seed reproduces the same transcript from a
         // fresh conversation. A continued turn (clear_kv=false) keeps the stream going, matching the
         // KV it decodes against.
-        if (im.smpl) llama_sampler_reset(im.smpl);
+        if (smpl_to_use) llama_sampler_reset(smpl_to_use);
     }
+
 
     // Format the prompt. With chat on, render the model's OWN chat template (real Jinja) over the
     // WHOLE conversation so far, and set up reasoning parsing so a thinking model's internal
@@ -962,9 +1148,12 @@ RunResult Session::generate(const GenerateRequest & req,
     }
     if (n_prompt < 1) return fail("empty prompt after tokenization");
     tokens.resize(n_prompt);
-    if (n_prompt + req.n_predict + 8 > im.cfg.n_ctx)
-        return fail("prompt + n_predict exceeds the session n_ctx (" + std::to_string(im.cfg.n_ctx) +
+    if (n_prompt + 8 >= im.cfg.n_ctx)
+        return fail("prompt exceeds the session n_ctx (" + std::to_string(im.cfg.n_ctx) +
                     "); open the session with a larger n_ctx");
+    const int effective_n_predict = std::max(1, std::min(req.n_predict, im.cfg.n_ctx - n_prompt - 8));
+
+
 
     // The text to surface: with chat on, parse the raw output so a reasoning model's internal
     // thinking is separated from the answer. The answer is shown inline; the reasoning is handed to
@@ -1059,11 +1248,10 @@ RunResult Session::generate(const GenerateRequest & req,
         trace_step = base_pos + n_tokens - 1;
     };
     auto trace_flush = [&]() {
-        // Close the compute trace's dangling interval FIRST: at layer granularity the "post" row
-        // is charged the wall since the last boundary, and everything trace_flush does before the
-        // close would be billed to the LM head.
-        if (im.compute_trace) im.hook->end_compute_batch();
+        // Close the compute trace's dangling interval FIRST and restore any bound layer tensors:
+        im.hook->end_compute_batch();
         if (im.route_trace) {
+
             im.hook->end_trace_batch();
             std::vector<RouteTraceRow> & rows = im.hook->trace_rows();
             if (!rows.empty()) im.route_trace->on_rows(rows.data(), rows.size());
@@ -1198,9 +1386,11 @@ RunResult Session::generate(const GenerateRequest & req,
     // to the resident reference the gates check); with a sampling chain, draw from the context's
     // last-position logits, which llama_sampler_sample reads at index -1 — the same logits argmax
     // would have read.
-    llama_token tok = im.smpl ? llama_sampler_sample(im.smpl, ctx, -1) : argmax(logits, im.n_vocab);
+    llama_token tok = smpl_to_use ? llama_sampler_sample(smpl_to_use, ctx, -1) : argmax(logits, im.n_vocab);
+    if (smpl_to_use) llama_sampler_accept(smpl_to_use, tok);
 
-    while (n_gen < req.n_predict) {
+
+    while (n_gen < effective_n_predict) {
         if (llama_vocab_is_eog(im.vocab, tok)) break;
 
         // ── draft ──
@@ -1208,8 +1398,9 @@ RunResult Session::generate(const GenerateRequest & req,
         // draft accepted past n_predict would be verified, charged for, and then discarded. The cap
         // goes in BEFORE drafting, so no source is ever asked for tokens with nowhere to go.
         int n_draft = 0;
-        double draft_s = 0.0;                       // this group's drafting + catch-up (see below)
-        const int room = req.n_predict - n_gen - 1; // tokens still wanted after `tok` itself
+        double draft_s = 0.0;                             // this group's drafting + catch-up (see below)
+        const int room = effective_n_predict - n_gen - 1; // tokens still wanted after `tok` itself
+
         if (spec_on && room > 0) {
             const auto d0 = clock_t_::now();
             const uint64_t db0 = moe.enabled ? im.source.stats().read_bytes : 0;
@@ -1376,7 +1567,7 @@ RunResult Session::generate(const GenerateRequest & req,
             prev_ra_issue_ns = ri;
             prev_ra_wd_ns = rw;
         }
-        for (size_t e = 0; e < confirmed.size() && n_gen < req.n_predict; ++e) {
+        for (size_t e = 0; e < confirmed.size() && n_gen < effective_n_predict; ++e) {
             const llama_token out = confirmed[e];
             char piece[256];
             int np = llama_token_to_piece(im.vocab, out, piece, sizeof(piece), 0, true);
@@ -1388,7 +1579,8 @@ RunResult Session::generate(const GenerateRequest & req,
 
             TokenMetrics m;
             m.step = n_gen;
-            m.steps = req.n_predict;
+            m.steps = effective_n_predict;
+
             m.mtp_batch = (int) confirmed.size();
             m.loop_overhead_ms = e == 0 ? overhead * 1000.0 : 0.0;
             // Charged to the group's first row like every other group cost. This is a SLICE of
@@ -1419,7 +1611,9 @@ RunResult Session::generate(const GenerateRequest & req,
         n_past += 1 + n_acc;
         const int32_t row = wide ? n_acc : -1;
         logits = llama_get_logits_ith(ctx, row);
-        tok = im.smpl ? llama_sampler_sample(im.smpl, ctx, row) : argmax(logits, im.n_vocab);
+        tok = smpl_to_use ? llama_sampler_sample(smpl_to_use, ctx, row) : argmax(logits, im.n_vocab);
+        if (smpl_to_use) llama_sampler_accept(smpl_to_use, tok);
+
     }
 
     // Speculation can leave the KV ahead of what the caller received: an accepted end-of-generation

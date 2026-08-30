@@ -49,6 +49,34 @@ target_link_libraries(bmoe_stall_union_test PRIVATE bmoe_core)
 target_include_directories(bmoe_stall_union_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
 add_test(NAME stall_union COMMAND bmoe_stall_union_test)
 
+# Adaptive Replacement Cache (ARC) test. Verifies T1/T2/B1/B2 transitions and pinned expert retention.
+add_executable(bmoe_arc_cache_test arc_cache_test.cpp)
+target_link_libraries(bmoe_arc_cache_test PRIVATE bmoe_core)
+target_include_directories(bmoe_arc_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
+add_test(NAME arc_cache COMMAND bmoe_arc_cache_test)
+
+# Windows Direct I/O and Pinned Memory test.
+add_executable(bmoe_win32_io_test win32_direct_io_test.cpp)
+target_link_libraries(bmoe_win32_io_test PRIVATE bmoe_core)
+target_include_directories(bmoe_win32_io_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/io)
+add_test(NAME win32_direct_io COMMAND bmoe_win32_io_test)
+
+# Dual-Stream CUDA Staging and VRAM Ring Buffer test.
+add_executable(bmoe_cuda_staging_test cuda_staging_test.cpp)
+target_link_libraries(bmoe_cuda_staging_test PRIVATE bmoe_core)
+target_include_directories(bmoe_cuda_staging_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe ${CMAKE_SOURCE_DIR}/core/src/io)
+add_test(NAME cuda_staging COMMAND bmoe_cuda_staging_test)
+
+# SP-MoE Lookahead Routing and D-CFR Verification test.
+add_executable(bmoe_sp_moe_dcfr_test sp_moe_dcfr_test.cpp)
+target_link_libraries(bmoe_sp_moe_dcfr_test PRIVATE bmoe_core)
+target_include_directories(bmoe_sp_moe_dcfr_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe ${CMAKE_SOURCE_DIR}/core/src/engine ${CMAKE_SOURCE_DIR}/core/src/io)
+add_test(NAME sp_moe_dcfr COMMAND bmoe_sp_moe_dcfr_test)
+
+
+
+
+
 find_program(PYTHON3 NAMES python3 python)
 
 if(PYTHON3)

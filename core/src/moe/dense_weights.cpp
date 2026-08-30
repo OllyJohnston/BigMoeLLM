@@ -1,10 +1,12 @@
 #include "dense_weights.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+
 
 namespace bmoe {
 
@@ -36,14 +38,25 @@ bool DenseWeights::init(DenseWeightsMode mode,
     paths_ = paths;
     align_ = align ? align : 4096;
     ranges_ = std::move(ranges);
-    tensors_ = std::move(tensors);
     basenames_.clear();
     for (const std::string & p : paths_) {
         const size_t slash = p.find_last_of("/\\");
         basenames_.push_back(slash == std::string::npos ? p : p.substr(slash + 1));
     }
 
+    // Do NOT rebind tensors that are already residing in a GPU device backend buffer (CUDA0)
+    std::vector<DenseTensorRef> host_tensors;
+    host_tensors.reserve(tensors.size());
+    for (const DenseTensorRef & d : tensors) {
+        if (d.tensor && d.tensor->buffer && !ggml_backend_buffer_is_host(d.tensor->buffer)) {
+            continue; // Keep GPU device buffer intact
+        }
+        host_tensors.push_back(d);
+    }
+    tensors_ = std::move(host_tensors);
+
     hold_back_oversized();
+
 
     if (mode_ == DenseWeightsMode::Anonymous || mode_ == DenseWeightsMode::Pinned) {
         if (tensors_.empty()) { // nothing (left) to rebind — behave as Mmap

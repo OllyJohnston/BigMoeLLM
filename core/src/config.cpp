@@ -50,16 +50,14 @@ ValidationResult validate(const RunConfig & cfg) {
         if (cfg.sampling.top_p <= 0.0f || cfg.sampling.top_p > 1.0f) {
             return fail("sampling.top_p must be in (0, 1]");
         }
+        if (cfg.sampling.min_p < 0.0f || cfg.sampling.min_p > 1.0f) {
+            return fail("sampling.min_p must be in [0, 1]");
+        }
+        if (cfg.sampling.repeat_penalty < 0.0f) {
+            return fail("sampling.repeat_penalty must be >= 0");
+        }
     }
 
-    // Verification is exact only because greedy acceptance compares argmax against argmax. Under a
-    // sampling chain the accepted prefix would depend on which draws happened to agree, which is a
-    // different distribution from the one the caller asked for. Rejected rather than silently
-    // ignored: a caller who asked for both was promised something the engine cannot give.
-    if (cfg.spec.enabled() && cfg.sampling.temp > 0.0f) {
-        return fail("speculative decoding requires greedy decoding (sampling.temp <= 0): verification is "
-                    "token-identical to single-token decode only under argmax.");
-    }
     // The floor is 1 (draft one token, verify two positions); at 0 there is nothing to verify and
     // the loop degenerates into plain decode with the speculative scaffolding attached. The ceiling
     // is an evidence boundary, not a physical one — see SpecConfig::draft_max.

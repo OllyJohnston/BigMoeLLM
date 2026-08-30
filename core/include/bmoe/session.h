@@ -33,9 +33,16 @@ class IIoTraceSink;
 // the longest prompt+generation the session will serve.
 struct SessionConfig {
     std::string model_path;
-    int n_threads = 4;
+    std::string mmproj_path; // path to multimodal projector (mmproj.gguf) for vision models
+    int n_threads = 12;
     int n_ctx = 2048;
     int n_batch = 512; // prefill chunk capacity; longer prompts are prefilled in n_batch slices
+    int n_gpu_layers = 0; // number of layers to offload to GPU (0 = CPU only)
+    std::string cache_type_k = "f16";
+    std::string cache_type_v = "f16";
+    bool flash_attn = true;
+
+
     // Widest graph actually computed at once. 0 = follow n_batch. Sizing this down trades prefill
     // throughput for resident compute buffers, which on this engine compete with the expert cache.
     // See RunConfig::n_ubatch.
@@ -53,7 +60,9 @@ struct SessionConfig {
     // open() builds the wider verify batch, and — for the MTP source only — the draft context.
     // See RunConfig::spec.
     SpecConfig spec;
+    FlashNextConfig flash_next;
 };
+
 
 // The RunConfig → SessionConfig mapping, in one place. Both entry points that open a session from a
 // RunConfig — run() and the CLI's interactive loop — need it, and they used to spell it out field by
@@ -86,6 +95,8 @@ struct GenerateRequest {
     int n_predict = 32;
     bool think = true;
     bool clear_kv = true;
+    // Optional images for vision models (base64 data URL or URL)
+    std::vector<std::string> images;
     // Populate TokenMetrics::text / ::reasoning on every token. Building them means parsing the
     // WHOLE generation so far — the chat parser cannot resume — so it is O(n) per token and O(n²)
     // over a turn, and in chat mode it also allocates a copy of everything generated. A UI that
@@ -93,6 +104,8 @@ struct GenerateRequest {
     // default output, and every benchmark run) does not, and should turn it off. Default on so an
     // embedder that does not know about this flag keeps the old behaviour.
     bool render_text = true;
+    bool has_sampling = false;
+    SamplingConfig sampling;
 };
 
 class Session {

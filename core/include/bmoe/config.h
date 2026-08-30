@@ -19,9 +19,14 @@ namespace bmoe {
 // builds the standard chain top_k -> top_p -> temp -> dist. Opt-in by construction: sampling never
 // perturbs a run that did not ask for it, so the gates stay meaningful.
 struct SamplingConfig {
-    float temp = 0.0f;           // <= 0: greedy (argmax). > 0: stochastic sampling.
-    int top_k = 40;              // 0 disables the top-k stage (llama.cpp convention)
-    float top_p = 0.95f;         // nucleus cutoff, in (0, 1]
+    float temp = 0.7f;           // <= 0: greedy (argmax). > 0: stochastic sampling. Default 0.7
+    int top_k = 40;              // 0 disables the top-k stage (llama.cpp convention). Default 40
+    float top_p = 0.95f;         // nucleus cutoff, in (0, 1]. Default 0.95
+    float min_p = 0.05f;         // min-p cutoff. Default 0.05
+    float repeat_penalty = 1.1f; // repetition penalty. Default 1.1
+    float presence_penalty = 0.0f; // presence penalty. Default 0.0
+    float frequency_penalty = 0.0f; // frequency penalty. Default 0.0
+    int repeat_last_n = 64;      // last n tokens to penalize (0 = disable)
     uint32_t seed = 0xFFFFFFFFu; // == LLAMA_DEFAULT_SEED (random per run); static_assert'd in session.cpp
 };
 
@@ -88,7 +93,17 @@ struct MoeStreamConfig {
     // so validate() rejects it when both are off. See docs/prefetch.md.
     int prefetch_layers = 0;
 
+    // Number of early MoE layers to statically retain/pin in VRAM (0 = disabled).
+    // Layers 0..n_pinned_layers-1 stay permanently resident in CUDA0 VRAM, eliminating PCIe transfers
+    // for the first N layers and matching LM Studio's hybrid split.
+    int n_pinned_layers = 16;
+
+    // Hybrid CPU MoE mode: unpinned expert weights mapped statically to system RAM (mmap)
+    // Attention/norms and first N layers run on CUDA0; unpinned FFNs compute on 12 CPU threads.
+    bool cpu_moe = false;
+
     // How the dense (non-expert) weights are treated. The streamer only rebinds experts; the rest —
+
     // gguf header/metadata, embeddings, attention, norms, lm_head — is handled by one of three
     // policies (see core/src/moe/dense_weights.h):
     //   Mmap      leave them mmap'd; the kernel serves and reclaims them (a >RAM model then demand-
@@ -290,13 +305,29 @@ struct SpecConfig {
     bool is_ngram() const { return source == DraftSource::ngram; }
 };
 
+// Qwen3.8-Flash-Next architecture options.
+struct FlashNextConfig {
+    bool enabled = false;
+    bool async_ngram_pager = true;      // async Direct I/O paging for 51B N-gram embedding table
+    bool gdn_recurrent_states = true;   // VRAM state buffers for 3x GDN layers (cuts KV cache by 75%)
+    bool gated_residual_streams = true; // 4-branch parallel residual streams
+};
+
 // A full run: model, prompt, decoding, streaming, telemetry.
 struct RunConfig {
     std::string model_path;
+    std::string mmproj_path; // path to multimodal projector (mmproj.gguf) for vision models
     std::string prompt = "The capital of Japan is";
     int n_predict = 128;
-    int n_threads = 4;
+    int n_threads = 12;
     int n_ctx = 2048;
+    int n_batch = 0; // prefill chunk size; 0 = default (512).
+    int n_gpu_layers = 0; // number of layers to offload to GPU (0 = CPU only)
+    std::string cache_type_k = "f16"; // KV cache quantization type for K (e.g. q8_0, q4_0, f16)
+    std::string cache_type_v = "f16"; // KV cache quantization type for V (e.g. q8_0, q4_0, f16)
+    bool flash_attn = true;           // Flash Attention flag
+
+
 
     // Largest batch computed in one graph, i.e. the prefill chunk size. 0 (the default) means
     // "follow n_ctx", which prefills any fitting prompt in a single pass.
@@ -339,7 +370,9 @@ struct RunConfig {
     SamplingConfig sampling; // greedy by default (temp <= 0); opt-in stochastic decoding
     MoeStreamConfig moe;
     SpecConfig spec; // self-speculative decoding (MTP head or n-gram lookup); off by default
+    FlashNextConfig flash_next;
 };
+
 
 // Validation result: ok plus a human-readable reason when not.
 struct ValidationResult {

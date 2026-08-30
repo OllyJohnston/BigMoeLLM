@@ -22,6 +22,8 @@
 #include "../io/platform_io.h"
 #include "../io/file_reader.h"
 #include "dense_weights.h" // DenseWeights + DenseTensorRef
+#include "cuda_expert_stager.h"
+
 
 #include <atomic>
 #include <condition_variable>
@@ -115,7 +117,14 @@ public:
     void set_io_trace(bool on);
     void take_io_trace_rows(std::vector<IoTraceRow> & out);
 
+    CudaExpertStager & cuda_stager() { return cuda_stager_; }
+    const CudaExpertStager & cuda_stager() const { return cuda_stager_; }
+    bool cuda_staging_enabled() const { return cuda_staging_enabled_; }
+    int n_expert() const { return n_expert_; }
+
     void shutdown();
+
+
 
 private:
     struct IoJob {
@@ -352,6 +361,10 @@ private:
     std::vector<std::pair<const void *, uint32_t>> texp_;
     std::vector<int> staged_; // per-load sorted unique expert scratch
     bool hook_registered_ = false;
+
+    CudaExpertStager cuda_stager_;
+    bool cuda_staging_enabled_ = false;
 };
+
 
 } // namespace bmoe

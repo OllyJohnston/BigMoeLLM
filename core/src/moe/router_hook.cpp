@@ -1,7 +1,9 @@
 #include "router_hook.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "../io/platform_io.h"
+
 
 #include <cmath>
 #include <cstdio>
@@ -253,8 +255,24 @@ void RouterHook::close_drop_layer() {
         predict_after_load(D.layer);
         route_ahead_collect(D.layer);
     }
+
+#if defined(BMOE_HAVE_CUDA)
+    auto * src_impl = dynamic_cast<ExpertStreamSource *>(source_);
+    if (src_impl && src_impl->cuda_staging_enabled() && D.layer >= 0 && D.layer < (int) captured_.size()) {
+        const LayerExperts & L = captured_[D.layer];
+        if (L.bound) {
+            for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                if (L.proj[p].tensor) {
+                    src_impl->cuda_stager().restore_tensor(D.layer, L.proj[p].tensor);
+                }
+            }
+        }
+    }
+#endif
+
     D.layer = -1;
 }
+
 
 // ── expert-prediction accuracy probe ────────────────────────────────────────────────────
 //
@@ -1170,12 +1188,14 @@ void RouterHook::ctrace_close_segment(int interval_layer, const char * tail_name
 }
 
 void RouterHook::end_compute_batch() {
+    close_drop_layer();
     // Node granularity has no dangling interval: the last node was itself isolated and observed.
     // The tail row absorbs whatever ran between the last boundary and this call — keep the call
     // adjacent to llama_decode's return or the decode epilogue is billed to the LM head.
     if (!ctrace_on_ || !ctrace_layers_) return;
     ctrace_close_segment(-1, "post");
 }
+
 
 bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
     // ── compute trace: close the previous node's interval, open the next ──
@@ -1350,11 +1370,27 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
             apply_route_ahead(t, il, nu, nt);
         }
 
+        std::vector<int32_t> host_topk;
+        const char * topk_data = (const char *) t->data;
+        const bool on_gpu = t->buffer && !ggml_backend_buffer_is_host(t->buffer);
+        if (on_gpu) {
+            const size_t total_view_bytes =
+                (size_t) (nt > 0 ? (size_t) (nt - 1) * t->nb[1] + (size_t) nu * sizeof(int32_t) : 0);
+            if (total_view_bytes > 0) {
+                host_topk.resize((total_view_bytes + sizeof(int32_t) - 1) / sizeof(int32_t));
+                ggml_backend_tensor_get(t, host_topk.data(), 0, total_view_bytes);
+                topk_data = (const char *) host_topk.data();
+            }
+        }
+
         gathered_.clear();
-        for (int j = 0; j < nt; ++j)
-            for (int k = 0; k < nu; ++k)
-                gathered_.push_back(
-                    *(const int32_t *) ((const char *) t->data + (size_t) j * t->nb[1] + (size_t) k * t->nb[0]));
+        for (int j = 0; j < nt; ++j) {
+            for (int k = 0; k < nu; ++k) {
+                size_t off = (size_t) j * t->nb[1] + (size_t) k * t->nb[0];
+                gathered_.push_back(*(const int32_t *) (topk_data + off));
+            }
+        }
+
 
         if (trace_on_) {
             flush_pending(); // the previous layer's whole weight chain has been offered by now
@@ -1397,11 +1433,29 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
             drop_ids_ = gathered_;
         } else {
             source_->load_layer(il, gathered_.data(), (int) gathered_.size());
+#if defined(BMOE_HAVE_CUDA)
+            auto * src_impl = dynamic_cast<ExpertStreamSource *>(source_);
+            if (src_impl && src_impl->cuda_staging_enabled() && il >= 0 && il < (int) captured_.size()) {
+                const LayerExperts & L = captured_[il];
+                if (L.bound) {
+                    size_t proj_offset = 0;
+                    for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                        if (L.proj[p].tensor) {
+                            src_impl->cuda_stager().bind_layer_for_compute(il, L.proj[p].tensor, proj_offset);
+                            size_t total_proj_bytes = (size_t) ((uint64_t) src_impl->n_expert() * L.proj[p].nb2);
+                            proj_offset += (total_proj_bytes + 255ull) & ~255ull;
+
+                        }
+                    }
+                }
+            }
+#endif
             // Deferred layers speculate from apply_drop instead — after THEIR load, for the same
             // reason this call sits after the one above: the load's quiesce would cancel it.
             predict_after_load(il);
             route_ahead_collect(il);
         }
+
 
         // Score the predictors against the routing the router just produced — before the record
         // below moves on, or the previous-token predictor would be graded on the answer itself.
@@ -1427,12 +1481,15 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
             std::vector<int32_t> & rec = prev_ids_[il];
             rec.clear();
             const int last = nt - 1;
-            for (int k = 0; k < nu; ++k)
-                rec.push_back(
-                    *(const int32_t *) ((const char *) t->data + (size_t) last * t->nb[1] + (size_t) k * t->nb[0]));
+            for (int k = 0; k < nu; ++k) {
+                size_t off = (size_t) last * t->nb[1] + (size_t) k * t->nb[0];
+                rec.push_back(*(const int32_t *) (topk_data + off));
+
+            }
         }
     }
     return true;
+
 }
 
 } // namespace bmoe

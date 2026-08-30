@@ -27,6 +27,7 @@ if(BMOE_HAVE_LLAMA)
         src/moe/gguf_offsets.cpp
         src/moe/expert_stream_source.cpp
         src/moe/router_hook.cpp
+        src/moe/ngram_lookup_pager.cpp
         src/engine/session.cpp
         src/engine/chat_parse.cpp
         src/engine/thinking_control.cpp
@@ -39,7 +40,12 @@ if(BMOE_HAVE_LLAMA)
     # `common` utils) is linked only for chat-template rendering + reasoning parsing
     # (common_chat_*); it is not a stable API. It propagates the common/ and vendor/ includes.
     target_link_libraries(bmoe_core PUBLIC llama llama-common)
+    target_include_directories(bmoe_core PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llama.cpp/ggml/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llama.cpp/ggml/include
+    )
     target_compile_definitions(bmoe_core PUBLIC BMOE_HAVE_LLAMA=1)
+
     find_package(Threads REQUIRED)
     target_link_libraries(bmoe_core PUBLIC Threads::Threads)
 
@@ -48,6 +54,13 @@ if(BMOE_HAVE_LLAMA)
         # `--dense-weights ahwb` (pio::pinned_alloc). No other platform has an equivalent.
         target_link_libraries(bmoe_core PUBLIC android)
     endif()
+
+    if(GGML_CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(bmoe_core PUBLIC CUDA::cudart)
+        target_compile_definitions(bmoe_core PUBLIC BMOE_HAVE_CUDA=1)
+    endif()
+
 
     # Intra-layer I/O–compute overlap needs the fork's expert-ready hook in ggml-cpu.h. Detect
     # it by inspecting the submodule header rather than the git remote, so any tree carrying the

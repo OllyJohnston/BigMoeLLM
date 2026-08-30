@@ -7,7 +7,12 @@
 #include <windows.h>
 #include <malloc.h>
 #include <cstring>
+#include <vector>
+#if defined(BMOE_HAVE_CUDA)
+#include <cuda_runtime.h>
+#endif
 #else
+
 #include <fcntl.h>
 #include <unistd.h>
 #include <algorithm>
@@ -52,7 +57,17 @@ bool fd_ok(fd_t fd) {
 }
 
 fd_t open_read(const char * path, bool direct) {
-    DWORD flags = FILE_ATTRIBUTE_NORMAL | (direct ? FILE_FLAG_NO_BUFFERING : 0);
+    DWORD flags = FILE_ATTRIBUTE_NORMAL;
+    if (direct) {
+        flags |= (FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED);
+    }
+    int len = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    if (len > 0) {
+        std::vector<wchar_t> wpath((size_t) len);
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath.data(), len);
+        HANDLE h = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
+        return (fd_t) h;
+    }
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
     return (fd_t) h;
 }
@@ -70,11 +85,23 @@ long long pread_at(fd_t fd, void * buf, size_t count, uint64_t off) {
     // size, so cap per-call length to a sector-aligned 1 GiB chunk (0x7FFFFFFF is odd).
     DWORD to_read = count > 0x40000000ull ? 0x40000000ul : (DWORD) count;
     DWORD got = 0;
-    if (!ReadFile((HANDLE) fd, buf, to_read, &got, &ov)) {
-        return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
+    BOOL res = ReadFile((HANDLE) fd, buf, to_read, &got, &ov);
+    if (!res) {
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING) {
+            if (!GetOverlappedResult((HANDLE) fd, &ov, &got, TRUE)) {
+                err = GetLastError();
+                return err == ERROR_HANDLE_EOF ? 0 : -1;
+            }
+        } else if (err == ERROR_HANDLE_EOF) {
+            return 0;
+        } else {
+            return -1;
+        }
     }
     return (long long) got;
 }
+
 
 uint64_t file_size(fd_t fd) {
     LARGE_INTEGER sz;
@@ -82,11 +109,22 @@ uint64_t file_size(fd_t fd) {
 }
 
 void * alloc_aligned(size_t align, size_t sz) {
+#if defined(BMOE_HAVE_CUDA)
+    void * ptr = nullptr;
+    if (cudaHostAlloc(&ptr, sz, cudaHostAllocMapped | cudaHostAllocPortable | cudaHostAllocWriteCombined) == cudaSuccess && ptr) {
+        return ptr;
+    }
+#endif
     return _aligned_malloc(sz, align);
 }
 void aligned_free(void * p) {
-    if (p) _aligned_free(p);
+    if (!p) return;
+#if defined(BMOE_HAVE_CUDA)
+    if (cudaFreeHost(p) == cudaSuccess) return;
+#endif
+    _aligned_free(p);
 }
+
 
 size_t vm_page() {
     SYSTEM_INFO si;
@@ -423,6 +461,66 @@ void pinned_free(PinnedAlloc * a) {
     a->size = 0;
 }
 
+#elif defined(BMOE_HAVE_CUDA) || defined(_WIN32)
+
+size_t pinned_max_bytes() {
+    return (size_t) 48ull * 1024ull * 1024ull * 1024ull; // Up to 48 GB host RAM cache
+}
+
+bool pinned_alloc(size_t sz, PinnedAlloc * out) {
+    if (!out || sz == 0) return false;
+    out->base = nullptr;
+    out->handle = nullptr;
+    out->size = 0;
+    void * ptr = nullptr;
+#if defined(BMOE_HAVE_CUDA)
+    cudaError_t err = cudaHostAlloc(&ptr, sz, cudaHostAllocMapped | cudaHostAllocWriteCombined | cudaHostAllocPortable);
+    if (err == cudaSuccess && ptr) {
+
+        out->base = ptr;
+        out->handle = (void *) 1; // 1 = cudaHostAlloc
+        out->size = sz;
+        return true;
+    }
+#endif
+#if defined(_WIN32)
+    ptr = VirtualAlloc(nullptr, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (ptr) {
+        out->base = ptr;
+        out->handle = (void *) 2; // 2 = VirtualAlloc
+        out->size = sz;
+        return true;
+    }
+#endif
+    return false;
+}
+
+
+void pinned_free(PinnedAlloc * a) {
+    if (!a || !a->base) return;
+#if defined(BMOE_HAVE_CUDA)
+    if (a->handle == (void *) 1) {
+        cudaFreeHost(a->base);
+        a->base = nullptr;
+        a->handle = nullptr;
+        a->size = 0;
+        return;
+    }
+#endif
+#if defined(_WIN32)
+    if (a->handle == (void *) 2) {
+        VirtualFree(a->base, 0, MEM_RELEASE);
+        a->base = nullptr;
+        a->handle = nullptr;
+        a->size = 0;
+        return;
+    }
+#endif
+    a->base = nullptr;
+    a->handle = nullptr;
+    a->size = 0;
+}
+
 #else
 
 size_t pinned_max_bytes() {
@@ -434,5 +532,6 @@ bool pinned_alloc(size_t, PinnedAlloc *) {
 void pinned_free(PinnedAlloc *) {}
 
 #endif
+
 
 } // namespace bmoe::pio
