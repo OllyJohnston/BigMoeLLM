@@ -587,16 +587,11 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     std::vector<llama_model_tensor_buft_override> buft_overrides;
     if (mparams.n_gpu_layers > 0 && (cfg.moe.enabled || cfg.moe.cpu_moe)) {
         const int n_pinned = cfg.moe.n_pinned_layers;
-        ggml_backend_buffer_type_t target_buft = nullptr;
-        if (cfg.moe.cpu_moe) {
-            target_buft = ggml_backend_cpu_buffer_type();
-        } else {
 #if defined(BMOE_HAVE_CUDA)
-            target_buft = get_dummy_cuda_buft();
+        ggml_backend_buffer_type_t target_buft = get_dummy_cuda_buft();
 #else
-            target_buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t target_buft = ggml_backend_cpu_buffer_type();
 #endif
-        }
         for (int il = n_pinned; il < 256; ++il) {
             buft_override_patterns.push_back("blk\\." + std::to_string(il) + "\\.ffn_.*exps.*");
         }
