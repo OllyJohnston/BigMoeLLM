@@ -3,6 +3,7 @@
 #include "cuda_stream_manager.h"
 #include "vram_ring_buffer.h"
 #include "cuda_occupancy.h"
+#include "arc_cache.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -266,6 +267,106 @@ public:
             }
         }
     }
+
+    // MoE Hot-Expert LRU / frequency cache in spare VRAM (~1.0 to 1.5 GB)
+    bool init_hot_expert_cache(size_t cache_bytes = 1536ull * 1024ull * 1024ull, size_t slice_bytes = 0) {
+#if defined(BMOE_HAVE_CUDA)
+        if (cache_bytes == 0 || slice_bytes == 0) return false;
+        cleanup_hot_expert_cache();
+
+        size_t free_bytes = 0, total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+            if (free_bytes < cache_bytes + 512ull * 1024ull * 1024ull) {
+                cache_bytes = free_bytes > 768ull * 1024ull * 1024ull ? free_bytes - 512ull * 1024ull * 1024ull : 0;
+            }
+        }
+        if (cache_bytes < slice_bytes) return false;
+
+        void * d_ptr = nullptr;
+        if (cudaMalloc(&d_ptr, cache_bytes) != cudaSuccess) return false;
+
+        d_hot_cache_ = d_ptr;
+        hot_cache_cap_ = cache_bytes;
+        hot_slice_bytes_ = slice_bytes;
+        const size_t max_hot_experts = cache_bytes / slice_bytes;
+        hot_arc_.set_capacity(max_hot_experts);
+        hot_slots_.resize(max_hot_experts);
+        for (size_t i = 0; i < max_hot_experts; ++i) {
+            hot_slots_[i].d_ptr = (char *) d_hot_cache_ + i * slice_bytes;
+            hot_slots_[i].key = 0xFFFFFFFF;
+            hot_slots_[i].in_use = false;
+        }
+
+        std::fprintf(stderr, "bmoe: MoE hot-expert VRAM cache initialized (%zu MiB, %zu slots)\n",
+                     cache_bytes / (1024 * 1024), max_hot_experts);
+        return true;
+#else
+        (void) cache_bytes; (void) slice_bytes;
+        return false;
+#endif
+    }
+
+    bool is_expert_hot(int layer_idx, int expert_idx) const {
+        uint32_t key = ((uint32_t) layer_idx << 16) | (uint32_t) (expert_idx & 0xFFFF);
+        return hot_arc_.is_resident(key);
+    }
+
+    void * get_hot_expert_ptr(int layer_idx, int expert_idx) {
+        uint32_t key = ((uint32_t) layer_idx << 16) | (uint32_t) (expert_idx & 0xFFFF);
+        std::lock_guard<std::mutex> lk(hot_mtx_);
+        auto it = hot_key_to_slot_.find(key);
+        if (it != hot_key_to_slot_.end()) {
+            return hot_slots_[it->second].d_ptr;
+        }
+        return nullptr;
+    }
+
+    void record_expert_access(int layer_idx, int expert_idx, const void * h_src = nullptr, size_t size = 0) {
+        if (!d_hot_cache_ || hot_slots_.empty()) return;
+        uint32_t key = ((uint32_t) layer_idx << 16) | (uint32_t) (expert_idx & 0xFFFF);
+        auto res = hot_arc_.access(key);
+
+        std::lock_guard<std::mutex> lk(hot_mtx_);
+        // Handle evictions
+        for (uint32_t evicted_key : res.evicted_resident_keys) {
+            auto it = hot_key_to_slot_.find(evicted_key);
+            if (it != hot_key_to_slot_.end()) {
+                size_t slot_idx = it->second;
+                hot_slots_[slot_idx].in_use = false;
+                hot_slots_[slot_idx].key = 0xFFFFFFFF;
+                hot_key_to_slot_.erase(it);
+            }
+        }
+
+        // If miss and we have host data, stage hot expert into available slot
+        if (!res.hit && h_src && size > 0 && size <= hot_slice_bytes_) {
+            for (size_t i = 0; i < hot_slots_.size(); ++i) {
+                if (!hot_slots_[i].in_use) {
+                    hot_slots_[i].in_use = true;
+                    hot_slots_[i].key = key;
+                    hot_key_to_slot_[key] = i;
+#if defined(BMOE_HAVE_CUDA)
+                    cudaMemcpyAsync(hot_slots_[i].d_ptr, h_src, size, cudaMemcpyHostToDevice, stream_mgr_.transfer_stream());
+#endif
+                    break;
+                }
+            }
+        }
+    }
+
+    void cleanup_hot_expert_cache() {
+#if defined(BMOE_HAVE_CUDA)
+        if (d_hot_cache_) {
+            cudaFree(d_hot_cache_);
+            d_hot_cache_ = nullptr;
+        }
+        hot_cache_cap_ = 0;
+        hot_slice_bytes_ = 0;
+        hot_slots_.clear();
+        hot_key_to_slot_.clear();
+        hot_arc_.clear();
+#endif
+    }
 #endif
 
     bool is_inited() const { return inited_; }
@@ -276,6 +377,12 @@ private:
     struct TensorBackup {
         void * orig_data = nullptr;
         ggml_backend_buffer_t orig_buffer = nullptr;
+    };
+
+    struct HotSlot {
+        void * d_ptr = nullptr;
+        uint32_t key = 0xFFFFFFFF;
+        bool in_use = false;
     };
 
     bool inited_ = false;
@@ -292,6 +399,15 @@ private:
     std::mutex swap_mtx_;
     std::unordered_map<ggml_tensor *, TensorBackup> orig_states_;
     std::unordered_map<int, VramRingBuffer::Slot *> active_slots_;
+
+    // Hot-expert cache state
+    void * d_hot_cache_ = nullptr;
+    size_t hot_cache_cap_ = 0;
+    size_t hot_slice_bytes_ = 0;
+    AdaptiveReplacementCache<uint32_t> hot_arc_;
+    std::vector<HotSlot> hot_slots_;
+    std::unordered_map<uint32_t, size_t> hot_key_to_slot_;
+    std::mutex hot_mtx_;
 };
 
 } // namespace bmoe
