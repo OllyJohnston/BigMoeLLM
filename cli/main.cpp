@@ -569,6 +569,8 @@ int main(int argc, char ** argv) {
 
         else if (a == "--ubatch")
             cfg.n_ubatch = std::atoi(next("--ubatch"));
+        else if (a == "-b" || a == "--batch" || a == "--batch-size")
+            cfg.n_batch = std::atoi(next(a.c_str()));
         else if (a == "--n-expert-used")
             cfg.n_expert_used = std::atoi(next("--n-expert-used"));
         else if (a == "--temp")
