@@ -614,10 +614,11 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
 
         if (cfg.moe.enabled || cfg.moe.cpu_moe) {
             const int n_pinned = cfg.moe.n_pinned_layers;
+            ggml_backend_buffer_type_t target_buft = cfg.moe.cpu_moe ? ggml_backend_cpu_buffer_type() :
 #if defined(BMOE_HAVE_CUDA)
-            ggml_backend_buffer_type_t target_buft = get_dummy_cuda_buft();
+                get_dummy_cuda_buft();
 #else
-            ggml_backend_buffer_type_t target_buft = ggml_backend_cpu_buffer_type();
+                ggml_backend_cpu_buffer_type();
 #endif
             for (int il = n_pinned; il < 256; ++il) {
                 buft_override_patterns.push_back("blk\\." + std::to_string(il) + "\\.ffn_.*exps.*");
