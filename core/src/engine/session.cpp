@@ -183,10 +183,12 @@ static enum ggml_type parse_kv_cache_type(const std::string & s) {
     if (s == "q8_0" || s == "Q8_0") return GGML_TYPE_Q8_0;
     if (s == "q4_0" || s == "Q4_0") return GGML_TYPE_Q4_0;
     if (s == "q4_1" || s == "Q4_1") return GGML_TYPE_Q4_1;
+    if (s == "iq4_nl" || s == "IQ4_NL") return GGML_TYPE_IQ4_NL;
     if (s == "q5_0" || s == "Q5_0") return GGML_TYPE_Q5_0;
     if (s == "q5_1" || s == "Q5_1") return GGML_TYPE_Q5_1;
     if (s == "f32" || s == "F32") return GGML_TYPE_F32;
     if (s == "bf16" || s == "BF16") return GGML_TYPE_BF16;
+    if (s == "f16" || s == "F16") return GGML_TYPE_F16;
     return GGML_TYPE_F16; // default
 }
 
@@ -685,7 +687,10 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     cparams.type_k = parse_kv_cache_type(cfg.cache_type_k);
     cparams.type_v = parse_kv_cache_type(cfg.cache_type_v);
 
-    if (cfg.flash_attn || cparams.type_v != GGML_TYPE_F16) {
+    const bool is_quant_k = (cparams.type_k != GGML_TYPE_F16 && cparams.type_k != GGML_TYPE_F32 && cparams.type_k != GGML_TYPE_BF16);
+    const bool is_quant_v = (cparams.type_v != GGML_TYPE_F16 && cparams.type_v != GGML_TYPE_F32 && cparams.type_v != GGML_TYPE_BF16);
+
+    if (cfg.flash_attn || is_quant_k || is_quant_v) {
         cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     } else {
         cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
