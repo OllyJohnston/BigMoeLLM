@@ -112,6 +112,12 @@ static bool dummy_cuda_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer
     return s_orig_cuda_supports_buft ? s_orig_cuda_supports_buft(dev, buft) : false;
 }
 
+static bool cuda_always_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    (void) dev;
+    (void) op;
+    return true;
+}
+
 static ggml_backend_buffer_type_t get_dummy_cuda_buft() {
     static struct ggml_backend_buffer_type dummy_buft;
     static bool init = false;
@@ -123,9 +129,12 @@ static ggml_backend_buffer_type_t get_dummy_cuda_buft() {
         dummy_buft.iface.get_alloc_size = dummy_buft_get_alloc_size;
 
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(real_buft);
-        if (dev && dev->iface.supports_buft != dummy_cuda_supports_buft) {
-            s_orig_cuda_supports_buft = dev->iface.supports_buft;
-            dev->iface.supports_buft = dummy_cuda_supports_buft;
+        if (dev) {
+            dev->iface.offload_op = cuda_always_offload_op;
+            if (dev->iface.supports_buft != dummy_cuda_supports_buft) {
+                s_orig_cuda_supports_buft = dev->iface.supports_buft;
+                dev->iface.supports_buft = dummy_cuda_supports_buft;
+            }
         }
         init = true;
     }
@@ -722,11 +731,23 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
 
     if (cfg.spec.enabled()) cparams.n_rs_seq = (uint32_t) cfg.spec.draft_max;
 
+#if defined(BMOE_HAVE_CUDA)
+    cparams.op_offload = !cfg.moe.cpu_moe;
+#endif
+
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) return fail("failed to create context");
     im.ctx.reset(ctx);
-    llama_set_n_threads(ctx, cfg.n_threads, cfg.n_threads);
-    std::fprintf(stderr, "llama threadpool init, n_threads = %d\n", cfg.n_threads);
+    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(cfg.n_threads);
+    tpp.poll = 100;
+    tpp.prio = GGML_SCHED_PRIO_HIGH;
+    ggml_threadpool_t tp = ggml_threadpool_new(&tpp);
+    if (tp) {
+        llama_attach_threadpool(ctx, tp, tp);
+    } else {
+        llama_set_n_threads(ctx, cfg.n_threads, cfg.n_threads);
+    }
+    std::fprintf(stderr, "llama threadpool init, n_threads = %d (poll=100, prio=HIGH)\n", cfg.n_threads);
 
     // The MTP draft context: same model, same eval callback, but ctx_type = MTP so llama.cpp builds
     // the nextn graph. It keeps its own (single-position) KV, hence n_rs_seq = 0 — nothing is ever
