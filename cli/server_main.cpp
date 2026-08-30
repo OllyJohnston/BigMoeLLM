@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -550,6 +551,65 @@ static void handle_request(socket_t fd, const HttpRequest & req, ServerState & s
     send_json_error(fd, 404, "Not found", ka);
 }
 
+static void print_lmstudio_telemetry(const RunSummary & sum, double ttft_ms, double total_sec) {
+    char lbuf[64];
+    char rbuf[64];
+
+    std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "┌─────────────────────────────────────────────────────────────┐\n");
+    std::fprintf(stderr, "│ Generation Statistics                                       │\n");
+    std::fprintf(stderr, "├──────────────────────────────┬──────────────────────────────┤\n");
+
+    // Time to First Token (TTFT)
+    if (ttft_ms <= 0.0 && sum.prefill_seconds > 0.0) {
+        ttft_ms = sum.prefill_seconds * 1000.0;
+    }
+    std::snprintf(lbuf, sizeof(lbuf), "Time to First Token (TTFT)");
+    std::snprintf(rbuf, sizeof(rbuf), "%.2f ms", ttft_ms);
+    std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
+
+    // Prompt Processing (Prefill)
+    double prefill_toks = (sum.prefill_seconds > 0.0) ? ((double) sum.n_prompt / sum.prefill_seconds) : 0.0;
+    std::snprintf(lbuf, sizeof(lbuf), "Prompt Processing (Prefill)");
+    std::snprintf(rbuf, sizeof(rbuf), "%d tokens @ %.2f tok/s", sum.n_prompt, prefill_toks);
+    std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
+
+    // Token Generation (Decode)
+    double decode_toks = (sum.gen_seconds > 0.0) ? ((double) sum.n_generated / sum.gen_seconds) : sum.tokens_per_second;
+    std::snprintf(lbuf, sizeof(lbuf), "Token Generation (Decode)");
+    std::snprintf(rbuf, sizeof(rbuf), "%d tokens @ %.2f tok/s", sum.n_generated, decode_toks);
+    std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
+
+    // Total Response Time
+    int total_tokens = sum.n_prompt + sum.n_generated;
+    std::snprintf(lbuf, sizeof(lbuf), "Total Response Time");
+    if (total_sec < 60.0) {
+        std::snprintf(rbuf, sizeof(rbuf), "%.2f s (%d tokens total)", total_sec, total_tokens);
+    } else {
+        std::snprintf(rbuf, sizeof(rbuf), "%.1f m (%d tokens total)", total_sec / 60.0, total_tokens);
+    }
+    std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
+
+    // Speculative Acceptance (MTP)
+    if (sum.mtp_drafted > 0) {
+        double accept_pct = (100.0 * (double) sum.mtp_accepted) / (double) sum.mtp_drafted;
+        double avg_len = (sum.mtp_decodes > 0) ? ((double) sum.n_generated / (double) sum.mtp_decodes) : 1.0;
+        std::snprintf(lbuf, sizeof(lbuf), "Speculative Acceptance (MTP)");
+        std::snprintf(rbuf, sizeof(rbuf), "%.1f%% (%lld/%lld, avg len: %.1f)", accept_pct, (long long) sum.mtp_accepted, (long long) sum.mtp_drafted, avg_len);
+        std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
+    }
+
+    // MoE VRAM ARC Cache Hit Rate
+    if (sum.cache_hit_pct >= 0.0) {
+        std::snprintf(lbuf, sizeof(lbuf), "MoE VRAM ARC Cache Hit Rate");
+        std::snprintf(rbuf, sizeof(rbuf), "%.1f%%", sum.cache_hit_pct);
+        std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
+    }
+
+    std::fprintf(stderr, "└──────────────────────────────┴──────────────────────────────┘\n\n");
+    std::fflush(stderr);
+}
+
 static void handle_completions(socket_t fd, const HttpRequest & req, ServerState & state, bool chat) {
 
     if (!state.session) {
@@ -639,13 +699,31 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
     // Global generation lock: serialize requests to prevent GPU stream/context collision
     std::unique_lock<std::mutex> gen_lock(state.generate_mtx);
 
+    auto req_start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point first_token_time;
+    bool got_first_token = false;
+
     if (!stream) {
-        auto result = state.session->generate(greq, nullptr, nullptr);
+        auto on_token_probe = [&](const TokenMetrics &) {
+            if (!got_first_token) {
+                first_token_time = std::chrono::steady_clock::now();
+                got_first_token = true;
+            }
+        };
+
+        auto result = state.session->generate(greq, on_token_probe, nullptr);
+        auto req_end = std::chrono::steady_clock::now();
+        double total_sec = std::chrono::duration<double>(req_end - req_start).count();
+        double ttft_ms = got_first_token
+                             ? std::chrono::duration<double, std::milli>(first_token_time - req_start).count()
+                             : (result.summary.prefill_seconds * 1000.0);
 
         if (!result) {
             send_json_error(fd, 500, result.error.c_str(), false);
             return;
         }
+
+        print_lmstudio_telemetry(result.summary, ttft_ms, total_sec);
 
         std::string reply_content = result.generated_text;
         if (reply_content.empty() && !result.reasoning_text.empty()) {
@@ -744,6 +822,11 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
     }
 
     auto on_token = [&](const TokenMetrics & m) {
+        if (!got_first_token) {
+            first_token_time = std::chrono::steady_clock::now();
+            got_first_token = true;
+        }
+
         std::string data = "{\"id\":\"" + id_prefix + "-" + std::to_string(created) +
                            "\","
                            "\"object\":\"" +
@@ -766,7 +849,15 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
     };
 
     auto result = state.session->generate(greq, on_token, nullptr);
+    auto req_end = std::chrono::steady_clock::now();
+    double total_sec = std::chrono::duration<double>(req_end - req_start).count();
+    double ttft_ms = got_first_token
+                         ? std::chrono::duration<double, std::milli>(first_token_time - req_start).count()
+                         : (result.summary.prefill_seconds * 1000.0);
+
     if (result) {
+        print_lmstudio_telemetry(result.summary, ttft_ms, total_sec);
+
         // Final chunk with usage and finish_reason
         std::string data = "{\"id\":\"" + id_prefix + "-" + std::to_string(created) +
                            "\","
