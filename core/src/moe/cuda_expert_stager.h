@@ -307,11 +307,13 @@ public:
     }
 
     bool is_expert_hot(int layer_idx, int expert_idx) const {
+        if (!d_hot_cache_ || hot_slots_.empty() || is_layer_pinned(layer_idx)) return false;
         uint32_t key = ((uint32_t) layer_idx << 16) | (uint32_t) (expert_idx & 0xFFFF);
         return hot_arc_.is_resident(key);
     }
 
     void * get_hot_expert_ptr(int layer_idx, int expert_idx) {
+        if (!d_hot_cache_ || hot_slots_.empty() || is_layer_pinned(layer_idx)) return nullptr;
         uint32_t key = ((uint32_t) layer_idx << 16) | (uint32_t) (expert_idx & 0xFFFF);
         std::lock_guard<std::mutex> lk(hot_mtx_);
         auto it = hot_key_to_slot_.find(key);
@@ -322,7 +324,7 @@ public:
     }
 
     void record_expert_access(int layer_idx, int expert_idx, const void * h_src = nullptr, size_t size = 0) {
-        if (!d_hot_cache_ || hot_slots_.empty()) return;
+        if (!d_hot_cache_ || hot_slots_.empty() || is_layer_pinned(layer_idx)) return;
         uint32_t key = ((uint32_t) layer_idx << 16) | (uint32_t) (expert_idx & 0xFFFF);
         auto res = hot_arc_.access(key);
 
