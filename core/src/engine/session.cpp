@@ -76,7 +76,6 @@ static const struct ggml_backend_buffer_i dummy_cuda_buffer_interface = {
 };
 
 static ggml_backend_buffer_t dummy_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    (void) buft;
     static void * s_shared_d_dummy = nullptr;
     static size_t s_shared_d_size = 0;
     constexpr size_t shared_cap = 640ull * 1024ull * 1024ull;
@@ -88,14 +87,29 @@ static ggml_backend_buffer_t dummy_buft_alloc_buffer(ggml_backend_buffer_type_t 
     auto * ctx = new dummy_cuda_buffer_context();
     ctx->d_ptr = s_shared_d_dummy;
     ctx->size = s_shared_d_size;
-    return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(0), dummy_cuda_buffer_interface, ctx, size);
+    return ggml_backend_buffer_init(buft, dummy_cuda_buffer_interface, ctx, size);
 }
-
 
 static size_t dummy_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     (void) buft;
     (void) tensor;
     return 256;
+}
+
+static const char * dummy_buft_get_name(ggml_backend_buffer_type_t buft) {
+    (void) buft;
+    return "CUDA_Dummy";
+}
+
+static bool (*s_orig_cuda_supports_buft)(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) = nullptr;
+
+static ggml_backend_buffer_type_t get_dummy_cuda_buft();
+
+static bool dummy_cuda_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    if (buft == get_dummy_cuda_buft()) {
+        return true;
+    }
+    return s_orig_cuda_supports_buft ? s_orig_cuda_supports_buft(dev, buft) : false;
 }
 
 static ggml_backend_buffer_type_t get_dummy_cuda_buft() {
@@ -104,8 +118,15 @@ static ggml_backend_buffer_type_t get_dummy_cuda_buft() {
     if (!init) {
         ggml_backend_buffer_type_t real_buft = ggml_backend_cuda_buffer_type(0);
         dummy_buft = *real_buft;
+        dummy_buft.iface.get_name = dummy_buft_get_name;
         dummy_buft.iface.alloc_buffer = dummy_buft_alloc_buffer;
         dummy_buft.iface.get_alloc_size = dummy_buft_get_alloc_size;
+
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(real_buft);
+        if (dev && dev->iface.supports_buft != dummy_cuda_supports_buft) {
+            s_orig_cuda_supports_buft = dev->iface.supports_buft;
+            dev->iface.supports_buft = dummy_cuda_supports_buft;
+        }
         init = true;
     }
     return &dummy_buft;
@@ -587,19 +608,24 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     std::vector<llama_model_tensor_buft_override> buft_overrides;
     if (mparams.n_gpu_layers > 0) {
         // Always keep the massive N-gram embedding table on host mmap/CPU buffer
-        buft_override_patterns.push_back("per_layer_token_embd.*");
-        buft_override_patterns.push_back(".*ple.*");
-        buft_override_patterns.push_back(".*token_embd_ngram.*");
+        buft_overrides.push_back({ "per_layer_token_embd.*", ggml_backend_cpu_buffer_type() });
+        buft_overrides.push_back({ ".*ple.*", ggml_backend_cpu_buffer_type() });
+        buft_overrides.push_back({ ".*token_embd_ngram.*", ggml_backend_cpu_buffer_type() });
 
         if (cfg.moe.enabled || cfg.moe.cpu_moe) {
             const int n_pinned = cfg.moe.n_pinned_layers;
+#if defined(BMOE_HAVE_CUDA)
+            ggml_backend_buffer_type_t target_buft = get_dummy_cuda_buft();
+#else
+            ggml_backend_buffer_type_t target_buft = ggml_backend_cpu_buffer_type();
+#endif
             for (int il = n_pinned; il < 256; ++il) {
                 buft_override_patterns.push_back("blk\\." + std::to_string(il) + "\\.ffn_.*exps.*");
             }
-        }
 
-        for (const auto & pat : buft_override_patterns) {
-            buft_overrides.push_back({ pat.c_str(), ggml_backend_cpu_buffer_type() });
+            for (const auto & pat : buft_override_patterns) {
+                buft_overrides.push_back({ pat.c_str(), target_buft });
+            }
         }
         buft_overrides.push_back({ nullptr, nullptr });
         mparams.tensor_buft_overrides = buft_overrides.data();
