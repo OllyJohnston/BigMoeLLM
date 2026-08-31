@@ -232,8 +232,11 @@ int main() {
         expect_fail("a negative n_ubatch is rejected", c);
     }
 
-    // Speculation: lossless only under greedy, and the draft width is bounded on both sides.
-    // These rules are shared by every draft source, so they are checked against the MTP one.
+    // Speculation: the draft width is bounded on both sides. These rules are shared by every
+    // draft source, so they are checked against the MTP one. There is deliberately NO
+    // greedy-only rule: the fork removed it (commit 96502a9) so --temp > 0 with a draft
+    // source is legal — heuristic mode, where a verified prefix is argmax-identical but later
+    // tokens sample as asked. See docs/mtp.md.
     {
         RunConfig c = ok_base();
         expect_ok("speculation off is the default and valid", c);
@@ -259,8 +262,8 @@ int main() {
         expect_fail("a negative confidence floor is rejected", c);
         c.spec.draft_p_min = 0.0f;
         c.sampling.temp = 0.8f;
-        expect_fail("speculation with a sampling chain is rejected", c);
-        // The same temperature is fine once speculation is off: the rejection is about the pair.
+        expect_ok("speculation with a sampling chain is allowed (heuristic mode)", c);
+        // The same temperature is fine with speculation off too, as it always was.
         c.spec.source = DraftSource::none;
         expect_ok("sampling without speculation stays valid", c);
     }
@@ -272,7 +275,7 @@ int main() {
         c.spec.source = DraftSource::ngram;
         expect_ok("the n-gram source with its defaults is valid", c);
         c.sampling.temp = 0.8f;
-        expect_fail("the n-gram source with a sampling chain is rejected", c);
+        expect_ok("the n-gram source with a sampling chain is allowed (heuristic mode)", c);
         c.sampling.temp = 0.0f;
         c.spec.draft_max = SpecConfig::draft_max_limit + 1;
         expect_fail("the draft-width limit applies to the n-gram source too", c);

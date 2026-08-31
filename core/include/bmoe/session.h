@@ -90,10 +90,27 @@ enum class ThinkControl {
 // Stable lowercase name ("template", "prefill", "none") for logs and the telemetry protocol.
 const char * think_control_name(ThinkControl c);
 
+// A chat message in the OpenAI wire format. Pure data (no llama.cpp types), so a server can
+// hand the engine the exact conversation a client sent. role is passed through to the model's
+// chat template; content is text only — a caller that receives multimodal parts flattens them
+// into content + GenerateRequest::images before filling this.
+struct ChatMessage {
+    std::string role;    // "system" | "user" | "assistant" (any string reaches the template)
+    std::string content;
+};
+
 // Per-prompt request. clear_kv=true (the default) makes each prompt independent while the
 // expert cache stays warm; clear_kv=false continues the KV cache for multi-turn chat.
 struct GenerateRequest {
     std::string prompt;
+    // The full conversation for this turn, newest message LAST (this turn's user message).
+    // When non-empty the engine ADOPTS it as the running conversation — replacing whatever
+    // transcript the session held — so a UI that owns the authoritative history can rewind or
+    // branch, and the engine re-renders exactly what the client sees. `prompt` is then only a
+    // raw-text fallback for non-chat callers. Combined with clear_kv=false, the engine's
+    // n_common prefix match serves this conversation from the previous turn's KV cache; a
+    // divergent history (new chat, rewind) is trimmed back to the shared prefix and re-prefilled.
+    std::vector<ChatMessage> messages;
     int n_predict = 32;
     bool think = true;
     bool clear_kv = true;

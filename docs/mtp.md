@@ -162,9 +162,15 @@ and at draft 3 above roughly half of them were rejected.
 It is a knob rather than a default because the useful value is a property of the device's balance
 between drafting cost and acceptance, and 0 is what the host numbers were measured at.
 
-Speculation requires greedy decoding: `validate()` rejects `--mtp` together with `--temp > 0`,
-because acceptance under a sampling chain would depend on which draws happened to agree and the run
-would no longer be the single-token run it claims to be.
+Upstream rejected `--mtp` together with `--temp > 0`, because acceptance under a sampling chain
+depends on which draws happened to agree, so the run would not be the single-token run it claims
+to be. This engine deliberately allows the pair (commit `96502a9`): the config gate is gone, and
+`validate()` no longer rejects a draft source with `temp > 0`. It is **heuristic mode** — the
+verification of a draft group is still token-identical to a single-token decode under argmax, so
+an accepted prefix is exactly what greedy would have produced, but the token drawn after the
+accepted group samples from the requested distribution. What you lose is the claim that the whole
+run is deterministic: the same prompt and seed can diverge on the boundary token a draft group
+leaves behind. Benchmarks that need run-to-run identical output should stay greedy.
 
 ## How it is wired
 

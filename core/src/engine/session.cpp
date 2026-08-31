@@ -1137,21 +1137,44 @@ RunResult Session::generate(const GenerateRequest & req,
     }
 
 
+    // A caller that supplies the full conversation drives the multi-turn state from the client's
+    // own transcript: the engine adopts it wholesale, so a UI that keeps the authoritative history
+    // can rewind or branch a conversation and the engine follows. The LAST message is this turn's
+    // user prompt and stays the last history entry, so rollback and the assistant commit below keep
+    // working unchanged; prompt is then only a raw-text fallback for the non-chat path. On a
+    // divergent history the n_common match below trims the KV to the shared prefix and re-prefills
+    // the rest — a fresh chat whose first tokens match an old one reuses that prefix for free.
+    bool messages_given = !req.messages.empty();
+    if (messages_given) {
+        if (req.messages.back().role != "user")
+            return fail("the last message in 'messages' must have role \"user\"");
+        im.chat_history.clear();
+        im.chat_history.reserve(req.messages.size());
+        for (const ChatMessage & m : req.messages) {
+            common_chat_msg cm;
+            cm.role = m.role;
+            cm.content = m.content;
+            im.chat_history.push_back(std::move(cm));
+        }
+    }
+
     // Format the prompt. With chat on, render the model's OWN chat template (real Jinja) over the
     // WHOLE conversation so far, and set up reasoning parsing so a thinking model's internal
     // reasoning is stripped from the shown answer. req.think drives enable_thinking, per prompt.
-    std::string prompt = req.prompt;
+    std::string prompt = messages_given ? req.messages.back().content : req.prompt;
     bool chat_on = im.chat_on;
-    bool history_pushed = false;   // did we append this turn's user message to chat_history?
+    bool history_pushed = messages_given; // the last history entry is this turn's user message
     bool prefilled_answer = false; // closed the reasoning span in the prompt, so skip reasoning parse
     common_chat_parser_params parse_params;
     if (chat_on) {
         try {
-            common_chat_msg user_msg;
-            user_msg.role = "user";
-            user_msg.content = req.prompt;
-            im.chat_history.push_back(user_msg);
-            history_pushed = true;
+            if (!messages_given) {
+                common_chat_msg user_msg;
+                user_msg.role = "user";
+                user_msg.content = req.prompt;
+                im.chat_history.push_back(user_msg);
+                history_pushed = true;
+            }
 
             common_chat_templates_inputs inputs;
             inputs.messages = im.chat_history; // the full conversation, not just this turn

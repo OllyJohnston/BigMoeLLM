@@ -36,6 +36,17 @@ add_executable(bmoe_config_test config_test.cpp)
 target_link_libraries(bmoe_config_test PRIVATE bmoe_core)
 add_test(NAME config_validate COMMAND bmoe_config_test)
 
+# OpenAI-wire request parsing (bmoe-server's body parser). Pure text in, structured fields
+# out — no model, no sockets — so it runs unconditionally. Covers the failure modes of the
+# old hand-rolled splitting: braces in code blocks, literal "role"/"content" in text, and
+# the multimodal part-array format.
+add_executable(bmoe_openai_parse_test openai_parse_test.cpp)
+target_link_libraries(bmoe_openai_parse_test PRIVATE bmoe_core)
+target_include_directories(bmoe_openai_parse_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/cli
+    ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor)
+add_test(NAME openai_parse COMMAND bmoe_openai_parse_test)
+
 # The n-gram draft matcher. Pure policy over token ids (no llama.cpp, no model), so the drafting
 # decision is covered exhaustively here; what it costs is a bench question, not a test.
 add_executable(bmoe_ngram_test ngram_test.cpp)

@@ -7,12 +7,50 @@ Semantic Versioning.
 ## [0.23.0] - 2026-08-31
 
 ### Added
+- **Reasoning separated from answers (`bmoe-server`):** thinking tokens are now streamed to
+  `choices[0].delta.reasoning_content` and reported in the non-stream response's
+  `message.reasoning_content`, never leaked into `content`. The old code fell back to dumping the
+  thinking span into content when the answer was empty (a short `max_tokens` mid-reasoning), and
+  the stream sent raw token deltas that included the marker tags. Streaming chat now renders from
+  the engine's parsed `text`/`reasoning` fields, so Open WebUI / AnythingLLM show the thought in
+  their collapsible reasoning box and only the answer inline.
+- **Full-conversation multi-turn chat (`bmoe-server`):** the server now sends the whole
+  `messages` array to the engine and keeps the KV cache across turns (`clear_kv=false`), so the
+  `n_common` prefix match serves a continued chat from the previous turn's cache — the README's
+  "multi-turn KV reuse", which the old last-user-message extraction made unreachable. A divergent
+  history (new chat, rewind, branch) is trimmed back to the shared prefix and re-prefilled
+  automatically. `GenerateRequest::messages` carries the conversation; `prompt` remains the
+  raw-text fallback.
+- **OpenAI body parser on vendored nlohmann/json:** `bmoe-server` request parsing is no longer
+  hand-rolled string splitting. A `}` inside a code block no longer truncates a message object, a
+  literal `"role"`/`"content"` in the text no longer corrupts role detection, and multimodal part
+  arrays are parsed properly. Unit-tested in `tests/openai_parse_test.cpp` (`openai_parse` ctest).
+- **64 MiB request body limit:** `read_request` now accepts bodies up to 64 MiB, so base64 image
+  payloads (routinely 2-8 MiB) are no longer dropped at the old 1 MiB cap before vision processing
+  can begin.
+- **Multi-threaded connection handling (`bmoe-server`):** each accepted connection now runs in
+  its own worker thread, so `/v1/models`, `/health` and CORS preflight answer immediately while
+  another client streams a long generation. Concurrent generations are serialized on the
+  inference lock; a second generation arriving during an active one returns HTTP 429 with
+  `{"error":{"message":"Another generation is in progress; try again shortly"}}` instead of
+  blocking the accept loop.
+- **API key authentication (`--api-key SECRET`):** every endpoint (CORS `OPTIONS` preflight
+  exempt) requires `Authorization: Bearer SECRET` when a key is configured, returning HTTP 401
+  with `{"error":{"message":"Invalid or missing API key","type":"authentication_error"}}`
+  otherwise. Binding a non-loopback interface without a key prints a warning; the key is also
+  honoured via `BMOE_SERVER_API_KEY`.
+- **`GET /health` endpoint:** liveness probe that answers without touching the inference lock.
 - **Multimodal Projector Offload Control:** Added `--no-mmproj-offload` and `--mmproj-offload [on|off]` flags to `bmoe-cli` and `bmoe-server` to keep vision encoder / CLIP projector weights in host system RAM instead of device VRAM.
 - **KV Cache Offload Control:** Added `-nkqv` / `--no-offload-kqv` / `--no-kv-offload` flags to keep the KV cache in system RAM (`llama_context_params.offload_kqv = false`).
 - **MTP & Speculative Decoding Telemetry:** Added `Speculative Acceptance` and `Mean Draft Length` metrics rows to the `Generation Statistics` console summary box during speculative runs.
 - **Accurate Wall-Clock Decode Rate:** Corrected decode tokens/sec calculation in `bmoe-server` to measure true cumulative wall-clock time from first generated token to completion.
 
 ### Changed
+- **Speculation with a sampling chain is now legal (heuristic mode):** the config gate that
+  rejected `--mtp`/`--ngram` together with `--temp > 0` was removed earlier (`96502a9`); the
+  `config_validate` tests and `docs/mtp.md` now reflect it. A verified draft prefix is still
+  argmax-identical, but the token after the accepted group samples from the requested
+  distribution — runs are no longer deterministic under `--temp > 0` with a draft source.
 - **Documentation:** Updated README with experimental status disclaimer, full dated Change History entries, and architecture guides.
 
 ## [0.22.0] - 2026-08-28

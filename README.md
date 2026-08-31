@@ -148,6 +148,7 @@ build/cli/Release/bmoe-server.exe \
 | `-m, --model <path>` | Path to model GGUF file | Required |
 | `--port <int>` | HTTP server port | `10000` |
 | `--host <ip>` | Listening host interface | `127.0.0.1` |
+| `--api-key <secret>` | Require `Authorization: Bearer <secret>` on every endpoint (CORS `OPTIONS` exempt); non-loopback binds warn when absent | none |
 | `-ngl, --n-gpu-layers <int>` | Layers to offload to GPU | `99` (all) |
 | `--n-pinned-layers <int>` | Number of early layers to permanently pin in VRAM | `12` |
 | `--cpu-moe` | Enable static host RAM MoE mapping and CPU threadpool execution | `false` |

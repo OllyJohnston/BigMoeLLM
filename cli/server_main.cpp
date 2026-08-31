@@ -22,6 +22,8 @@
 #include "bmoe/metrics.h"
 #include "bmoe/version.h"
 
+#include "openai_body.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -36,6 +38,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -61,7 +64,12 @@ using namespace bmoe;
 // ── Socket helpers ───────────────────────────────────────────────────────────
 
 
-// ── Minimal JSON utilities (hand-rolled, dependency-free) ────────────────────
+// ── JSON helpers ─────────────────────────────────────────────────────────────
+// json_escape writes RESPONSES (engine-owned strings into our own JSON), so it stays
+// hand-rolled. Parsing REQUESTS is nlohmann's job — see openai_body.h, which is unit-
+// tested (tests/openai_parse_test.cpp) against the failure modes the old string
+// splitting had: a '}' inside a code block truncated a message object, and a literal
+// "role"/"content" in the text corrupted the substring matching.
 
 static std::string json_escape(const std::string & s) {
     std::string o;
@@ -96,218 +104,6 @@ static std::string json_escape(const std::string & s) {
     return o;
 }
 
-static size_t json_find_key(const std::string & json, const char * key) {
-    std::string pat = std::string("\"") + key + "\"";
-    size_t k = json.find(pat);
-    if (k == std::string::npos) return std::string::npos;
-    size_t c = json.find(':', k + pat.size());
-    if (c == std::string::npos) return std::string::npos;
-    return c + 1;
-}
-
-static std::string json_extract_string(const std::string & json, const char * key, const std::string & dflt) {
-    size_t p = json_find_key(json, key);
-    if (p == std::string::npos) return dflt;
-    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n'))
-        ++p;
-    if (p >= json.size() || json[p] != '"') return dflt;
-    ++p;
-    std::string raw;
-    for (; p < json.size(); ++p) {
-        if (json[p] == '\\' && p + 1 < json.size()) {
-            raw += json[p];
-            raw += json[p + 1];
-            ++p;
-        } else if (json[p] == '"') {
-            break;
-        } else {
-            raw += json[p];
-        }
-    }
-    // Unescape
-    std::string out;
-    for (size_t i = 0; i < raw.size(); ++i) {
-        if (raw[i] == '\\' && i + 1 < raw.size()) {
-            switch (raw[++i]) {
-            case 'n':
-                out += '\n';
-                break;
-            case 'r':
-                out += '\r';
-                break;
-            case 't':
-                out += '\t';
-                break;
-            case '"':
-                out += '"';
-                break;
-            case '\\':
-                out += '\\';
-                break;
-            default:
-                out += raw[i];
-                break;
-            }
-        } else {
-            out += raw[i];
-        }
-    }
-    return out;
-}
-
-static int json_extract_int(const std::string & json, const char * key, int dflt) {
-    size_t p = json_find_key(json, key);
-    if (p == std::string::npos) return dflt;
-    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n'))
-        ++p;
-    return std::atoi(json.c_str() + p);
-}
-
-static double json_extract_double(const std::string & json, const char * key, double dflt) {
-    size_t p = json_find_key(json, key);
-    if (p == std::string::npos) return dflt;
-    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n'))
-        ++p;
-    return std::atof(json.c_str() + p);
-}
-
-static bool json_extract_bool(const std::string & json, const char * key, bool dflt) {
-    size_t p = json_find_key(json, key);
-    if (p == std::string::npos) return dflt;
-    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n'))
-        ++p;
-    return json.compare(p, 4, "true") == 0;
-}
-
-// Extract the last user message content from a chat messages array.
-// Handles both string content ("content":"text") and array content.
-static std::string extract_last_user_message(const std::string & body) {
-    size_t msgs = body.find("\"messages\"");
-    if (msgs == std::string::npos) return "";
-
-    std::string last_content;
-    size_t pos = msgs;
-    while (true) {
-        size_t obj_start = body.find('{', pos);
-        if (obj_start == std::string::npos) break;
-        size_t obj_end = body.find('}', obj_start);
-        if (obj_end == std::string::npos) break;
-
-        std::string obj = body.substr(obj_start, obj_end - obj_start + 1);
-
-        size_t role_pos = obj.find("\"role\"");
-        bool is_user = false;
-        if (role_pos != std::string::npos) {
-            size_t r_colon = obj.find(':', role_pos + 6);
-            if (r_colon != std::string::npos) {
-                if (obj.find("\"user\"", r_colon) != std::string::npos) {
-                    is_user = true;
-                }
-            }
-        }
-
-        size_t content_pos = obj.find("\"content\"");
-        if (content_pos != std::string::npos) {
-            size_t cp = obj.find(':', content_pos + 9);
-            if (cp != std::string::npos) {
-                ++cp;
-                while (cp < obj.size() && (obj[cp] == ' ' || obj[cp] == '\t' || obj[cp] == '\n' || obj[cp] == '\r'))
-                    ++cp;
-                if (cp < obj.size()) {
-                    if (obj[cp] == '"') {
-                        ++cp;
-                        std::string raw;
-                        for (; cp < obj.size(); ++cp) {
-                            if (obj[cp] == '\\' && cp + 1 < obj.size()) {
-                                raw += obj[cp];
-                                raw += obj[cp + 1];
-                                ++cp;
-                            } else if (obj[cp] == '"') {
-                                break;
-                            } else {
-                                raw += obj[cp];
-                            }
-                        }
-                        std::string content;
-                        for (size_t i = 0; i < raw.size(); ++i) {
-                            if (raw[i] == '\\' && i + 1 < raw.size()) {
-                                switch (raw[++i]) {
-                                case 'n': content += '\n'; break;
-                                case 'r': content += '\r'; break;
-                                case 't': content += '\t'; break;
-                                case '"': content += '"'; break;
-                                case '\\': content += '\\'; break;
-                                default: content += raw[i]; break;
-                                }
-                            } else {
-                                content += raw[i];
-                            }
-                        }
-                        if (is_user) last_content = content;
-                    }
-                }
-            }
-        }
-
-        pos = obj_end + 1;
-    }
-    return last_content;
-}
-
-
-// Extract image URLs from the messages array (OpenAI-compatible format).
-// Returns a vector of image URLs (data URLs or HTTPS URLs).
-static std::vector<std::string> extract_images(const std::string & body) {
-    std::vector<std::string> images;
-    size_t msgs = body.find("\"messages\"");
-    if (msgs == std::string::npos) return images;
-
-    size_t pos = msgs;
-    while (true) {
-        // Find "type":"image_url"
-        size_t type_pos = body.find("\"type\"", pos);
-        if (type_pos == std::string::npos) break;
-        size_t type_val = type_pos + 7; // skip "type"
-        while (type_val < body.size() &&
-               (body[type_val] == ' ' || body[type_val] == ':' || body[type_val] == '\t' || body[type_val] == '\n'))
-            ++type_val;
-
-        bool is_image = body.compare(type_val, 12, "\"image_url\"") == 0;
-
-        if (is_image) {
-            // Find the "url" field within this image_url object
-            size_t url_pos = body.find("\"url\"", type_pos);
-            if (url_pos != std::string::npos) {
-                size_t url_val = url_pos + 6; // skip "url"
-                while (url_val < body.size() &&
-                       (body[url_val] == ' ' || body[url_val] == ':' || body[url_val] == '\t' || body[url_val] == '\n'))
-                    ++url_val;
-                if (url_val < body.size() && body[url_val] == '"') {
-                    ++url_val;
-                    std::string url;
-                    for (; url_val < body.size(); ++url_val) {
-                        if (body[url_val] == '\\' && url_val + 1 < body.size()) {
-                            url += body[url_val];
-                            url += body[url_val + 1];
-                            ++url_val;
-                        } else if (body[url_val] == '"') {
-                            break;
-                        } else {
-                            url += body[url_val];
-                        }
-                    }
-                    if (!url.empty()) {
-                        images.push_back(url);
-                    }
-                }
-            }
-        }
-        pos = type_pos + 7;
-    }
-    return images;
-}
-
-// ── HTTP primitives ──────────────────────────────────────────────────────────
 
 struct HttpRequest {
     std::string method;
@@ -315,6 +111,7 @@ struct HttpRequest {
     std::string query;
     std::string body;
     std::string content_type;
+    std::string authorization; // raw Authorization header value, empty when absent
     bool keep_alive = false;
     size_t content_length = 0;
 };
@@ -357,6 +154,7 @@ static bool parse_http_request(const std::string & raw, HttpRequest & req) {
             std::transform(key.begin(), key.end(), lkey.begin(), ::tolower);
 
             if (lkey == "content-type") req.content_type = val;
+            if (lkey == "authorization") req.authorization = val;
             if (lkey == "connection") {
                 std::string lv;
                 lv.resize(val.size());
@@ -469,6 +267,10 @@ struct ServerConfig {
     int max_connections = 32;
     bool disable_think = false;
     std::string mmproj_path;  // path to multimodal projector (mmproj.gguf) for vision models
+    // Shared secret enforced via `Authorization: Bearer <key>` on every endpoint (CORS
+    // OPTIONS preflight exempt). Empty = authentication disabled — acceptable on loopback
+    // only; a non-loopback bind with no key is refused with a warning.
+    std::string api_key;
 };
 
 struct ServerState {
@@ -484,13 +286,33 @@ struct ServerState {
 
 static void handle_completions(socket_t fd, const HttpRequest & req, ServerState & state, bool chat);
 
+// Request authentication. No api_key configured = open (loopback deployments). With a key set,
+// every endpoint except the CORS preflight below must present `Authorization: Bearer <key>`.
+static bool auth_ok(const HttpRequest & req, const ServerState & state) {
+    if (state.srv_cfg.api_key.empty()) return true;
+    if (req.authorization.rfind("Bearer ", 0) != 0) return false;
+    std::string tok = req.authorization.substr(7);
+    // Trim trailing CR/LF/space a header line may carry; exact match otherwise.
+    while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\r' || tok.back() == '\n')) tok.pop_back();
+    return tok == state.srv_cfg.api_key;
+}
+
 static void handle_request(socket_t fd, const HttpRequest & req, ServerState & state) {
     const bool ka = req.keep_alive;
     std::fprintf(stderr, "bmoe-server: HTTP %s %s (body=%zu bytes)\n", req.method.c_str(), req.path.c_str(), req.body.size());
 
-    // CORS preflight
+    // CORS preflight. Must pass WITHOUT authentication: browsers send OPTIONS before the real
+    // request and carry no Authorization header on it.
     if (req.method == "OPTIONS") {
         send_response(fd, 204, "No Content", "text/plain", "", ka);
+        return;
+    }
+
+    // API key gate. Only reached when api_key is configured; Open WebUI / AnythingLLM / curl
+    // all send Authorization on the real request, so a missing or wrong key is a flat 401.
+    if (!auth_ok(req, state)) {
+        const char * body = "{\"error\":{\"message\":\"Invalid or missing API key\",\"type\":\"authentication_error\"}}";
+        send_response(fd, 401, "Unauthorized", "application/json", body, ka);
         return;
     }
 
@@ -499,6 +321,14 @@ static void handle_request(socket_t fd, const HttpRequest & req, ServerState & s
         std::string body = "{\"name\":\"bmoe-server\","
                            "\"version\":\"" BMOE_VERSION "\","
                            "\"description\":\"BigMoeOnEdge streaming inference server\"}";
+        send_response(fd, 200, "OK", "application/json", body, ka);
+        return;
+    }
+
+    // GET /health — liveness probe. Never blocks on generation; answers from the accept-loop
+    // thread pool the moment the connection is read.
+    if (req.method == "GET" && req.path == "/health") {
+        const char * body = "{\"status\":\"ok\"}";
         send_response(fd, 200, "OK", "application/json", body, ka);
         return;
     }
@@ -621,87 +451,49 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
         return;
     }
 
-    // Build the prompt — accept both `messages` (chat) and `prompt` (completion) formats
-    std::string prompt;
-    std::vector<std::string> images;
-    if (req.body.find("\"messages\"") != std::string::npos) {
-        prompt = extract_last_user_message(req.body);
-        images = extract_images(req.body);
-    } else {
-        prompt = json_extract_string(req.body, "prompt", "");
-    }
-    if (prompt.empty()) {
-        send_json_error(fd, 400, "No user message or prompt found", false);
+    // Parse the OpenAI wire body. /v1/chat/completions (messages) and /v1/completions
+    // (prompt) both land here; the parser is nlohmann-based and unit-tested, so code
+    // blocks full of '}' or literal "role"/"content" in the text can no longer corrupt
+    // the message boundary scan (tests/openai_parse_test.cpp).
+    bmoe::openai::ParsedBody pb;
+    if (!bmoe::openai::parse_body(req.body, state.session_cfg.sampling, pb)) {
+        send_json_error(fd, 400, pb.error.c_str(), false);
         return;
     }
-    int n_predict = json_extract_int(req.body, "max_tokens", 0);
-    if (n_predict <= 0) n_predict = json_extract_int(req.body, "max_completion_tokens", 0);
-    if (n_predict <= 0) n_predict = 512;
     // Cap n_predict so web UI requests (e.g. AnythingLLM default 4096) never exceed session context size
     const int max_allowed = (std::max)(32, state.session->n_ctx() - 128);
-    if (n_predict > max_allowed) n_predict = max_allowed;
+    if (pb.n_predict > max_allowed) pb.n_predict = max_allowed;
 
-
-    SamplingConfig sc = state.session_cfg.sampling;
-    bool has_custom_sampling = false;
-
-    if (req.body.find("\"temperature\"") != std::string::npos) {
-        sc.temp = (float) json_extract_double(req.body, "temperature", sc.temp);
-        has_custom_sampling = true;
-    } else if (req.body.find("\"temp\"") != std::string::npos) {
-        sc.temp = (float) json_extract_double(req.body, "temp", sc.temp);
-        has_custom_sampling = true;
-    }
-
-    if (req.body.find("\"top_p\"") != std::string::npos) {
-        sc.top_p = (float) json_extract_double(req.body, "top_p", sc.top_p);
-        has_custom_sampling = true;
-    }
-
-    if (req.body.find("\"top_k\"") != std::string::npos) {
-        sc.top_k = json_extract_int(req.body, "top_k", sc.top_k);
-        has_custom_sampling = true;
-    }
-
-    if (req.body.find("\"min_p\"") != std::string::npos) {
-        sc.min_p = (float) json_extract_double(req.body, "min_p", sc.min_p);
-        has_custom_sampling = true;
-    }
-
-    if (req.body.find("\"repeat_penalty\"") != std::string::npos) {
-        sc.repeat_penalty = (float) json_extract_double(req.body, "repeat_penalty", sc.repeat_penalty);
-        has_custom_sampling = true;
-    } else if (req.body.find("\"repetition_penalty\"") != std::string::npos) {
-        sc.repeat_penalty = (float) json_extract_double(req.body, "repetition_penalty", sc.repeat_penalty);
-        has_custom_sampling = true;
-    }
-
-    if (req.body.find("\"presence_penalty\"") != std::string::npos) {
-        sc.presence_penalty = (float) json_extract_double(req.body, "presence_penalty", sc.presence_penalty);
-        has_custom_sampling = true;
-    }
-
-    if (req.body.find("\"frequency_penalty\"") != std::string::npos) {
-        sc.frequency_penalty = (float) json_extract_double(req.body, "frequency_penalty", sc.frequency_penalty);
-        has_custom_sampling = true;
-    }
-
-    bool stream = json_extract_bool(req.body, "stream", false);
+    const bool stream = pb.stream;
 
     // Build generate request
     GenerateRequest greq;
-    greq.prompt = prompt;
-    greq.images = images;
-    greq.n_predict = n_predict;
-    greq.render_text = !stream; // Render full text for non-streaming completions
+    greq.prompt = pb.prompt;
+    greq.messages = std::move(pb.messages);
+    greq.images = std::move(pb.images);
+    greq.n_predict = pb.n_predict;
+    greq.render_text = !stream || chat; // a chat stream needs the parsed text/reasoning deltas
     greq.think = !state.srv_cfg.disable_think;
-    greq.has_sampling = has_custom_sampling || sc.temp > 0.0f;
-    greq.sampling = sc;
+    greq.has_sampling = pb.has_sampling || pb.sampling.temp > 0.0f;
+    greq.sampling = pb.sampling;
+    // Chat is multi-turn: hand the engine the FULL conversation and keep the KV, so the
+    // n_common prefix match serves this turn from the previous one's cache — the README's
+    // "multi-turn KV reuse", which the old last-user-message extraction made unreachable.
+    // A divergent history (new chat, rewind) is trimmed back to the shared prefix by the
+    // engine. Raw completions stay stateless: clear_kv stays true, each prompt independent.
+    greq.clear_kv = !pb.is_chat;
     long created = static_cast<long>(std::time(nullptr));
 
 
-    // Global generation lock: serialize requests to prevent GPU stream/context collision
-    std::unique_lock<std::mutex> gen_lock(state.generate_mtx);
+    // Serialize inference: the session runs one generation at a time (the engine itself is not
+    // thread-safe across generate() calls). try_lock so a second generation request while one is
+    // streaming gets a clean 429 instead of blocking this worker — metadata endpoints never
+    // reach this mutex and answer immediately regardless.
+    std::unique_lock<std::mutex> gen_lock(state.generate_mtx, std::try_to_lock);
+    if (!gen_lock.owns_lock()) {
+        send_json_error(fd, 429, "Another generation is in progress; try again shortly", req.keep_alive);
+        return;
+    }
 
     auto req_start = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point first_token_time;
@@ -734,9 +526,9 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
         print_lmstudio_telemetry(result.summary, ttft_ms, decode_sec, total_sec);
 
         std::string reply_content = result.generated_text;
-        if (reply_content.empty() && !result.reasoning_text.empty()) {
-            reply_content = result.reasoning_text;
-        }
+        // generated_text already has the reasoning stripped by the engine's chat parser.
+        // NEVER fall back to reasoning_text here: shoving the thinking span into content
+        // is exactly the leak a chat UI would show as visible answer text.
 
         std::string id_prefix = chat ? "chatcmpl" : "cmpl";
         std::string object = chat ? "chat.completion" : "text_completion";
@@ -759,7 +551,10 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
                    "\"content\":\"" +
                    json_escape(reply_content) +
                    "\""
-                   "},"
+                   + (result.reasoning_text.empty()
+                          ? ""
+                          : ",\"reasoning_content\":\"" + json_escape(result.reasoning_text) + "\"")
+                   + "},"
                    "\"finish_reason\":\"stop\""
                    "}],"
                    "\"usage\":{"
@@ -829,6 +624,13 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
         send_sse(fd, data);
     }
 
+    // How much of each cumulative field has already been streamed. The engine re-parses the
+    // whole generation on every token (render_text=true), so m.text/m.reasoning grow monotonically;
+    // each SSE chunk carries only the not-yet-sent suffix, and the reasoning markers the parser
+    // consumed never appear in either stream.
+    std::string sent_content;
+    std::string sent_reasoning;
+
     auto on_token = [&](const TokenMetrics & m) {
         if (!got_first_token) {
             first_token_time = std::chrono::steady_clock::now();
@@ -847,7 +649,27 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
                            "\"choices\":[{";
 
         if (chat) {
-            data += "\"index\":0,\"delta\":{\"content\":\"" + json_escape(m.piece) + "\"},\"finish_reason\":null";
+            std::string new_reasoning = m.reasoning.size() > sent_reasoning.size()
+                                            ? m.reasoning.substr(sent_reasoning.size())
+                                            : std::string();
+            std::string new_content = m.text.size() > sent_content.size()
+                                          ? m.text.substr(sent_content.size())
+                                          : std::string();
+            sent_reasoning = m.reasoning;
+            sent_content = m.text;
+
+            data += "\"index\":0,\"delta\":{";
+            bool first = true;
+            if (!new_reasoning.empty()) {
+                data += "\"reasoning_content\":\"" + json_escape(new_reasoning) + "\"";
+                first = false;
+            }
+            if (!new_content.empty()) {
+                if (!first) data += ",";
+                data += "\"content\":\"" + json_escape(new_content) + "\"";
+            }
+            if (first) data += "\"content\":\"\"";
+            data += "},\"finish_reason\":null";
         } else {
             data += "\"index\":0,\"delta\":{\"text\":\"" + json_escape(m.piece) + "\"},\"finish_reason\":null";
         }
@@ -921,6 +743,11 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
 
 // Read the full HTTP request from a blocking socket: headers + body.
 // Returns false if the connection closed or the request was too large.
+// The body cap is sized for multimodal payloads: a single base64 image routinely lands
+// in the 2-8 MiB range, and the old 1 MiB limit silently dropped those connections
+// before vision processing could begin.
+static constexpr size_t MAX_BODY_SIZE = 64 * 1024 * 1024;
+
 static bool read_request(socket_t fd, std::string & raw) {
     char buf[65536];
     while (true) {
@@ -953,7 +780,7 @@ static bool read_request(socket_t fd, std::string & raw) {
                 size_t cl = (size_t) std::atoll(headers.c_str() + colon + 1);
                 if (raw.size() - body_start >= cl) return true; // full body received
                 // Need more body data
-                if (raw.size() > 1024 * 1024) return false; // body too large (>1MB)
+                if (raw.size() > MAX_BODY_SIZE) return false; // body too large
                 continue;
             } else {
                 return true; // malformed header, treat as header-only
@@ -997,6 +824,8 @@ static void print_usage(const char * argv0) {
                 "      --port N            HTTP server port (default 8080)\n"
                 "      --host ADDR         bind address (default 127.0.0.1; use 0.0.0.0 for\n"
                 "                          remote access)\n"
+                "      --api-key SECRET    require Authorization: Bearer SECRET on every endpoint\n"
+                "                          (mandatory when binding a non-loopback interface)\n"
                 "\n"
                 "  All bmoe-cli streaming and decoding flags are supported:\n"
                 "  -t, --threads, -ngl, --n-gpu-layers, -nkqv, --no-offload-kqv, -c, --ctx-size\n"
@@ -1022,6 +851,7 @@ static void print_usage(const char * argv0) {
                 "Environment:\n"
                 "  BMOE_SERVER_PORT  override --port\n"
                 "  BMOE_SERVER_HOST  override --host\n"
+                "  BMOE_SERVER_API_KEY  override --api-key\n"
                 "  All BMOE_* env vars from bmoe-cli also apply\n",
                 argv0);
 }
@@ -1080,6 +910,8 @@ int main(int argc, char ** argv) {
             srv.port = std::atoi(next("--port"));
         else if (a == "--host")
             srv.host = next("--host");
+        else if (a == "--api-key")
+            srv.api_key = next("--api-key");
         else if (a == "-p" || a == "--prompt") {
             next("-p"); // ignored in server mode
         } else if (a == "-n" || a == "--n-predict")
@@ -1243,6 +1075,17 @@ int main(int argc, char ** argv) {
     if (env_port && *env_port) srv.port = std::atoi(env_port);
     const char * env_host = std::getenv("BMOE_SERVER_HOST");
     if (env_host && *env_host) srv.host = env_host;
+    const char * env_key = std::getenv("BMOE_SERVER_API_KEY");
+    if (env_key && *env_key && srv.api_key.empty()) srv.api_key = env_key;
+
+    // Binding a non-loopback interface without a key is how the GPU ends up exposed to the
+    // local network; refuse to be quiet about it even when authentication is on.
+    const bool loopback = srv.host == "127.0.0.1" || srv.host == "localhost" || srv.host == "::1";
+    if (!loopback && srv.api_key.empty()) {
+        std::fprintf(stderr, "bmoe-server: WARNING: binding %s with no --api-key — every client on the network\n"
+                             "             can drive inference and read responses. Set --api-key to require auth.\n",
+                     srv.host.c_str());
+    }
 
     // bmoe-cli env overrides also apply
     if (!seen.count("--cache-mb")) {
@@ -1355,8 +1198,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // ── Simple single-threaded server loop ────────────────────────────
-    // One connection at a time; good enough for on-device use.
+    // ── Multi-threaded server loop ─────────────────────────────────────
+    // Each accepted connection runs in its own detached worker thread, so a long SSE
+    // generation on one client no longer blocks /v1/models, /health or other clients.
+    // The inference path is serialized inside handle_completions via generate_mtx
+    // (try_lock -> 429 when busy); metadata endpoints never touch it and stay fast.
     ServerState state;
     state.session = std::move(session);
     state.session_cfg = sc;
@@ -1377,15 +1223,19 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        try {
-            process_connection(client_fd, state);
-        } catch (const std::exception & ex) {
-            std::fprintf(stderr, "bmoe-server: exception during connection: %s\n", ex.what());
-        } catch (...) {
-            std::fprintf(stderr, "bmoe-server: unknown exception during connection\n");
-        }
-        close_socket(client_fd);
-
+        // Detached worker: `state` lives for the process lifetime (this loop never exits),
+        // so the reference stays valid for the connection. The thread owns the socket and
+        // closes it when done.
+        std::thread([client_fd, &state] {
+            try {
+                process_connection(client_fd, state);
+            } catch (const std::exception & ex) {
+                std::fprintf(stderr, "bmoe-server: exception during connection: %s\n", ex.what());
+            } catch (...) {
+                std::fprintf(stderr, "bmoe-server: unknown exception during connection\n");
+            }
+            close_socket(client_fd);
+        }).detach();
     }
 
     close_socket(listen_fd);
