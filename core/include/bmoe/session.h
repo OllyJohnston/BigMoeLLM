@@ -41,6 +41,7 @@ struct SessionConfig {
     std::string cache_type_k = "f16";
     std::string cache_type_v = "f16";
     bool flash_attn = true;
+    bool no_kv_offload = false; // keep KV cache in host system RAM (-nkqv, --no-offload-kqv, --no-kv-offload)
 
 
     // Widest graph actually computed at once. 0 = follow n_batch. Sizing this down trades prefill

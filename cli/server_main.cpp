@@ -551,14 +551,14 @@ static void handle_request(socket_t fd, const HttpRequest & req, ServerState & s
     send_json_error(fd, 404, "Not found", ka);
 }
 
-static void print_lmstudio_telemetry(const RunSummary & sum, double ttft_ms, double total_sec) {
+static void print_lmstudio_telemetry(const RunSummary & sum, double ttft_ms, double decode_sec, double total_sec) {
     char lbuf[64];
     char rbuf[64];
 
     std::fprintf(stderr, "\n");
-    std::fprintf(stderr, "┌─────────────────────────────────────────────────────────────┐\n");
+    std::fprintf(stderr, "┌──────────────────────────────┬──────────────────────────────┐\n");
     std::fprintf(stderr, "│ Generation Statistics                                       │\n");
-    std::fprintf(stderr, "├──────────────────────────────┬──────────────────────────────┤\n");
+    std::fprintf(stderr, "├──────────────────────────────┼──────────────────────────────┤\n");
 
     // Time to First Token (TTFT)
     if (ttft_ms <= 0.0 && sum.prefill_seconds > 0.0) {
@@ -575,10 +575,23 @@ static void print_lmstudio_telemetry(const RunSummary & sum, double ttft_ms, dou
     std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
 
     // Token Generation (Decode)
-    double decode_toks = (sum.gen_seconds > 0.0) ? ((double) sum.n_generated / sum.gen_seconds) : sum.tokens_per_second;
+    double decode_toks = (decode_sec > 0.0) ? ((double) sum.n_generated / decode_sec) : 0.0;
     std::snprintf(lbuf, sizeof(lbuf), "Token Generation (Decode)");
     std::snprintf(rbuf, sizeof(rbuf), "%d tokens @ %.2f tok/s", sum.n_generated, decode_toks);
     std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
+
+    // Speculative Acceptance & Mean Draft Length (when active / drafted > 0)
+    if (sum.mtp_drafted > 0) {
+        double accept_pct = (100.0 * (double) sum.mtp_accepted) / (double) sum.mtp_drafted;
+        std::snprintf(lbuf, sizeof(lbuf), "Speculative Acceptance");
+        std::snprintf(rbuf, sizeof(rbuf), "%.2f%% (%lld accepted / %lld)", accept_pct, (long long) sum.mtp_accepted, (long long) sum.mtp_drafted);
+        std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
+
+        double avg_len = (sum.mtp_decodes > 0) ? ((double) sum.n_generated / (double) sum.mtp_decodes) : 1.0;
+        std::snprintf(lbuf, sizeof(lbuf), "Mean Draft Length");
+        std::snprintf(rbuf, sizeof(rbuf), "%.2f tokens/step", avg_len);
+        std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
+    }
 
     // Total Response Time
     int total_tokens = sum.n_prompt + sum.n_generated;
@@ -589,15 +602,6 @@ static void print_lmstudio_telemetry(const RunSummary & sum, double ttft_ms, dou
         std::snprintf(rbuf, sizeof(rbuf), "%.1f m (%d tokens total)", total_sec / 60.0, total_tokens);
     }
     std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
-
-    // Speculative Acceptance (MTP)
-    if (sum.mtp_drafted > 0) {
-        double accept_pct = (100.0 * (double) sum.mtp_accepted) / (double) sum.mtp_drafted;
-        double avg_len = (sum.mtp_decodes > 0) ? ((double) sum.n_generated / (double) sum.mtp_decodes) : 1.0;
-        std::snprintf(lbuf, sizeof(lbuf), "Speculative Acceptance (MTP)");
-        std::snprintf(rbuf, sizeof(rbuf), "%.1f%% (%lld/%lld, avg len: %.1f)", accept_pct, (long long) sum.mtp_accepted, (long long) sum.mtp_drafted, avg_len);
-        std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
-    }
 
     // MoE VRAM ARC Cache Hit Rate
     if (sum.cache_hit_pct >= 0.0) {
@@ -717,13 +721,17 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
         double ttft_ms = got_first_token
                              ? std::chrono::duration<double, std::milli>(first_token_time - req_start).count()
                              : (result.summary.prefill_seconds * 1000.0);
+        double decode_sec = got_first_token
+                                ? std::chrono::duration<double>(req_end - first_token_time).count()
+                                : (total_sec - (ttft_ms / 1000.0));
+        if (decode_sec < 0.0) decode_sec = 0.0;
 
         if (!result) {
             send_json_error(fd, 500, result.error.c_str(), false);
             return;
         }
 
-        print_lmstudio_telemetry(result.summary, ttft_ms, total_sec);
+        print_lmstudio_telemetry(result.summary, ttft_ms, decode_sec, total_sec);
 
         std::string reply_content = result.generated_text;
         if (reply_content.empty() && !result.reasoning_text.empty()) {
@@ -854,9 +862,13 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
     double ttft_ms = got_first_token
                          ? std::chrono::duration<double, std::milli>(first_token_time - req_start).count()
                          : (result.summary.prefill_seconds * 1000.0);
+    double decode_sec = got_first_token
+                            ? std::chrono::duration<double>(req_end - first_token_time).count()
+                            : (total_sec - (ttft_ms / 1000.0));
+    if (decode_sec < 0.0) decode_sec = 0.0;
 
     if (result) {
-        print_lmstudio_telemetry(result.summary, ttft_ms, total_sec);
+        print_lmstudio_telemetry(result.summary, ttft_ms, decode_sec, total_sec);
 
         // Final chunk with usage and finish_reason
         std::string data = "{\"id\":\"" + id_prefix + "-" + std::to_string(created) +
@@ -985,8 +997,8 @@ static void print_usage(const char * argv0) {
                 "                          remote access)\n"
                 "\n"
                 "  All bmoe-cli streaming and decoding flags are supported:\n"
-                "  -t, --threads, -ngl, --n-gpu-layers, -c, --ctx-size, --ubatch, --batch-size\n"
-                "  --moe-stream, --cache-mb, --cache-floor-mb, --cache-ceil-mb,\n"
+                "  -t, --threads, -ngl, --n-gpu-layers, -nkqv, --no-offload-kqv, -c, --ctx-size\n"
+                "  --ubatch, --batch-size, --moe-stream, --cache-mb, --cache-floor-mb, --cache-ceil-mb,\n"
                 "  --io-threads, --no-odirect, --dense-weights,\n"
                 "  --prefetch, --predict-prefetch, --drop-cold-experts,\n"
                 "  --overlap, --io-two-wave, --route-ahead,\n"
@@ -1123,6 +1135,8 @@ int main(int argc, char ** argv) {
             cfg.flash_attn = true;
         else if (a == "--no-flash-attn" || a == "--no-fa")
             cfg.flash_attn = false;
+        else if (a == "-nkqv" || a == "--no-offload-kqv" || a == "--no-kv-offload" || a == "-nkvo")
+            cfg.no_kv_offload = true;
         else if (a == "--no-think") {
             cfg.think = false;
             srv.disable_think = true;

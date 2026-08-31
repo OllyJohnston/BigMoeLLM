@@ -730,6 +730,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     }
 
     if (cfg.spec.enabled()) cparams.n_rs_seq = (uint32_t) cfg.spec.draft_max;
+    cparams.offload_kqv = !cfg.no_kv_offload;
 
 #if defined(BMOE_HAVE_CUDA)
     cparams.op_offload = !cfg.moe.cpu_moe;

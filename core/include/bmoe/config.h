@@ -326,6 +326,7 @@ struct RunConfig {
     std::string cache_type_k = "f16"; // KV cache quantization type for K (e.g. q8_0, q4_0, f16)
     std::string cache_type_v = "f16"; // KV cache quantization type for V (e.g. q8_0, q4_0, f16)
     bool flash_attn = true;           // Flash Attention flag
+    bool no_kv_offload = false;       // keep KV cache in host system RAM (-nkqv, --no-offload-kqv, --no-kv-offload)
 
 
 

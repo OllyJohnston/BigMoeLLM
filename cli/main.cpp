@@ -358,6 +358,7 @@ static void print_usage(const char * argv0) {
         "  -n, --n-predict N       tokens to generate (default 128)\n"
         "  -t, --threads N         compute threads (default 4)\n"
         "  -ngl, --n-gpu-layers N  number of layers to offload to GPU (default 0)\n"
+        "  -nkqv, --no-offload-kqv disable KV cache offloading to GPU (keep KV in system RAM)\n"
         "  -c, --ctx-size N        context size (default 2048)\n"
         "\n"
         "      --ubatch N          widest graph computed at once (0 = as wide as the context).\n"
@@ -629,6 +630,8 @@ int main(int argc, char ** argv) {
             cfg.flash_attn = true;
         else if (a == "--no-flash-attn" || a == "--no-fa")
             cfg.flash_attn = false;
+        else if (a == "-nkqv" || a == "--no-offload-kqv" || a == "--no-kv-offload" || a == "-nkvo")
+            cfg.no_kv_offload = true;
         else if (a == "--chatml")
             cfg.chatml = true;
         else if (a == "--no-think")
