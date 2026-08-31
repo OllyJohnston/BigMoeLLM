@@ -354,6 +354,9 @@ static void print_usage(const char * argv0) {
         "usage: %s -m <model.gguf> [options]\n"
         "\n"
         "  -m, --model PATH        gguf model (required)\n"
+        "      --mmproj PATH       multimodal projector (mmproj.gguf) for vision models\n"
+        "      --no-mmproj-offload disable GPU offloading for multimodal projector / CLIP (keep in RAM)\n"
+        "      --mmproj-offload [on|off] enable/disable GPU offload for mmproj (default: on)\n"
         "  -p, --prompt STR        prompt text\n"
         "  -n, --n-predict N       tokens to generate (default 128)\n"
         "  -t, --threads N         compute threads (default 4)\n"
@@ -557,6 +560,18 @@ int main(int argc, char ** argv) {
         };
         if (a == "-m" || a == "--model")
             cfg.model_path = next("-m");
+        else if (a == "--mmproj")
+            cfg.mmproj_path = next("--mmproj");
+        else if (a == "--no-mmproj-offload")
+            cfg.mmproj_offload = false;
+        else if (a == "--mmproj-offload") {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string v = argv[++i];
+                cfg.mmproj_offload = (v == "1" || v == "true" || v == "on");
+            } else {
+                cfg.mmproj_offload = true;
+            }
+        }
         else if (a == "-p" || a == "--prompt")
             cfg.prompt = next("-p");
         else if (a == "-n" || a == "--n-predict")

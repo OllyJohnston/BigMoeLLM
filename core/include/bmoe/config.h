@@ -317,6 +317,7 @@ struct FlashNextConfig {
 struct RunConfig {
     std::string model_path;
     std::string mmproj_path; // path to multimodal projector (mmproj.gguf) for vision models
+    bool mmproj_offload = true; // whether to offload multimodal projector / CLIP to GPU (false keeps mmproj in host RAM)
     std::string prompt = "The capital of Japan is";
     int n_predict = 128;
     int n_threads = 12;

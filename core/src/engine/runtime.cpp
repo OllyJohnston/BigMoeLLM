@@ -9,6 +9,7 @@ SessionConfig session_config_from(const RunConfig & cfg) {
     SessionConfig sc;
     sc.model_path = cfg.model_path;
     sc.mmproj_path = cfg.mmproj_path;
+    sc.mmproj_offload = cfg.mmproj_offload;
     sc.n_threads = cfg.n_threads;
     sc.n_ctx = cfg.n_ctx;
     sc.n_batch = cfg.n_batch > 0 ? cfg.n_batch : cfg.n_ctx;     // configurable prefill batch size

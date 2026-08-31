@@ -992,6 +992,8 @@ static void print_usage(const char * argv0) {
                 "\n"
                 "  -m, --model PATH        gguf model (required)\n"
                 "      --mmproj PATH       multimodal projector (mmproj.gguf) for vision models\n"
+                "      --no-mmproj-offload disable GPU offload for multimodal projector (keep in RAM)\n"
+                "      --mmproj-offload [on|off] enable/disable GPU offload for mmproj (default: on)\n"
                 "      --port N            HTTP server port (default 8080)\n"
                 "      --host ADDR         bind address (default 127.0.0.1; use 0.0.0.0 for\n"
                 "                          remote access)\n"
@@ -1064,6 +1066,16 @@ int main(int argc, char ** argv) {
             cfg.model_path = next("-m");
         else if (a == "--mmproj")
             cfg.mmproj_path = next("--mmproj");
+        else if (a == "--no-mmproj-offload")
+            cfg.mmproj_offload = false;
+        else if (a == "--mmproj-offload") {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string v = argv[++i];
+                cfg.mmproj_offload = (v == "1" || v == "true" || v == "on");
+            } else {
+                cfg.mmproj_offload = true;
+            }
+        }
         else if (a == "--port")
             srv.port = std::atoi(next("--port"));
         else if (a == "--host")

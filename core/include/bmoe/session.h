@@ -34,6 +34,7 @@ class IIoTraceSink;
 struct SessionConfig {
     std::string model_path;
     std::string mmproj_path; // path to multimodal projector (mmproj.gguf) for vision models
+    bool mmproj_offload = true; // whether to offload multimodal projector / CLIP to GPU (false keeps mmproj in host RAM)
     int n_threads = 12;
     int n_ctx = 2048;
     int n_batch = 512; // prefill chunk capacity; longer prompts are prefilled in n_batch slices
