@@ -212,6 +212,36 @@ build/cli/Release/bmoe-cli.exe \
 
 ---
 
+## Command-Line Options & Memory Management Reference
+
+For custom inference engines and forks, users and downstream tools need clear documentation of non-standard or essential memory management switches.
+
+### Command-Line Options
+
+| Flag | Description | Default |
+|---|---|---|
+| `-m, --model <path>` | Path to model GGUF file. | Required |
+| `--port <port>` | HTTP listening port for the server. | `8080` (or `10000`) |
+| `-ngl, --n-gpu-layers <N>` | Number of layers to offload to GPU (`99` for full offload). | `0` |
+| `-c, --ctx-size <N>` | Context window size in tokens. | `4096` |
+| `-ctk, --cache-type-k <type>` | KV cache data type for keys (`f16`, `q8_0`, `q4_0`, etc.). | `f16` |
+| `-ctv, --cache-type-v <type>` | KV cache data type for values (`f16`, `q8_0`, `q4_0`, etc.). | `f16` |
+| `-nkqv, --no-offload-kqv` | Keep the KV cache in system RAM instead of VRAM. | Off |
+| `--no-mmproj-offload` | Keep multimodal projector (CLIP/ViT) weights in system RAM. | Off |
+| `--mmproj-offload [on\|off]` | Enable/disable GPU offloading for multimodal projector. | `on` |
+| `-fa, --flash-attn` | Enable Flash Attention kernels. | Off (or `on` when quantizing KV) |
+| `-b, --batch-size <N>` | Logical batch size for prompt processing. | `512` |
+| `-ub, --ubatch-size <N>` | Physical micro-batch size for GPU compute steps. | `512` |
+| `-t, --threads <N>` | Number of CPU compute threads to allocate. | Auto |
+
+### Key Flags Explained
+
+- **`-nkqv` / `--no-offload-kqv` / `--no-kv-offload`**: Keeps the entire KV cache allocated in host DDR4/DDR5 system memory while allowing all model layer weights to remain fully resident in VRAM (`-ngl 99`). This allows running 64k to 100k+ contexts on consumer GPUs without running out of VRAM.
+- **`--no-mmproj-offload`**: Leaves vision projector tensors in system RAM, freeing 1.0 to 2.5 GB of VRAM for larger context windows and model weights when running multimodal models.
+- **`-ctk q8_0 -ctv q8_0`**: Quantizes the key-value cache to 8-bit precision, cutting KV VRAM usage roughly in half with near-lossless attention quality. Use `q4_0` to reduce cache memory footprint by 75%.
+
+---
+
 ## Change History
 
 ### Recent Improvements & Milestones
