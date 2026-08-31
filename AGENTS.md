@@ -69,7 +69,7 @@ Android CLI: `pwsh scripts/build-android.ps1` (needs the NDK), then build the AP
 ## Conventions
 
 - **Commits:** Conventional Commits (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`,
-  `build:`, `ci:`, `chore:`). Author is **Helldez only** — do NOT add AI co-author or
+  `build:`, `ci:`, `chore:`). Author is **Olly Johnston only** (`Olly Johnston <76867450+OllyJohnston@users.noreply.github.com>`) — do NOT add AI co-author or
   session trailers to commits.
 - **Group commits.** One commit = one coherent change. Never a commit for a trivial
   tweak on its own — fold small fixes, doc touches and follow-ups into the change they

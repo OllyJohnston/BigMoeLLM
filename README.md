@@ -10,6 +10,9 @@
 
 ---
 
+> [!WARNING]
+> **Experimental Research Project**: BigMoeLLM is an experimental research and development engine actively exploring zero-fork hybrid VRAM pinning, NVMe streaming, and fast CPU MoE offload architectures for next-generation Mixture-of-Experts models. APIs, CLI flags, and internal scheduling heuristics are subject to rapid iteration.
+
 BigMoeLLM is a high-performance inference engine built to run large Mixture-of-Experts (MoE) language models that exceed your GPU's physical VRAM on ordinary consumer graphics cards (12 GB – 16 GB GPUs like RTX 4070 / 4080 / 5070 Ti) and desktop workstations.
 
 By combining **Hybrid VRAM Pinning**, **Zero-Copy Host MMAP Offloading**, **Continuous CUDA Graph Capture**, and **Direct I/O NVMe Expert Streaming**, BigMoeLLM achieves **64+ tok/s** on models like Qwen3.6-35B-A3B on a single 16 GB GPU—outperforming standard hybrid runtime splits while requiring zero in-tree patches to upstream `llama.cpp`.
@@ -206,6 +209,22 @@ build/cli/Release/bmoe-cli.exe \
   -n 256 \
   -p "Explain the mathematical intuition behind Sparse MoE routing."
 ```
+
+---
+
+## Change History
+
+### Recent Improvements & Milestones
+
+- **Batch Size Support & Submodule Synchronization (`f2141a5`)**: Added `-b` / `--batch` / `--batch-size` flag support to `bmoe-cli` for flexible prompt batching, and synchronized `llama.cpp` upstream submodule for latest architectural fixes.
+- **Windows Console & Telemetry Display (`2de7578`, `4c3005e`)**: Enabled UTF-8 console code page and ANSI Virtual Terminal Processing on Windows; implemented real-time performance telemetry summaries (prompt eval tok/s, decode tok/s, TTFT, and memory bandwidth).
+- **Critical Decode Path Acceleration (`75b531b`)**: Bypassed ARC caching bookkeeping and asynchronous prefetch worker triggers when hot-caching is inactive or when MoE layers are permanently pinned to VRAM, eliminating overhead on dense/MTP models.
+- **Hot-Expert ARC Cache (`68a4678`)**: Integrated Adaptive Replacement Cache (ARC) for hot MoE experts with CUDA staging and VRAM ring buffer management.
+- **High-Priority Polling Threadpool (`dfe3bbb`)**: Integrated a dedicated high-priority CPU worker threadpool with spin-polling to minimize CPU dispatch latency during `--cpu-moe` passes.
+- **Host MMAP Memory Preservation (`724ba68`, `8ea7555`)**: Enforced direct system RAM mmap weight mappings and protected massive models (such as Qwen3.8-Flash-Next and DeepSeek-V4) from VRAM exhaustion by overriding dense gather tables (`per_layer_token_embd`) to host-resident memory.
+- **Zero-Split Hybrid CUDA Graph Capture (`0d5fc7f`, `7776819`)**: Implemented unified CUDA dummy buffer bindings across hybrid CPU/GPU MoE boundaries, eliminating graph splits and enabling continuous CUDA graph reuse on CUDA Stream 0.
+- **KV Cache Quantization & Flash Attention Matrix (`db02fdb`)**: Expanded support for KV cache quantization (`-ctk q8_0`/`q4_0`, `-ctv q8_0`/`q4_0`) and enforced Flash Attention (`-fa`) integration across all supported models.
+- **OpenAI-Compatible Server Engine (`96502a9`)**: Built high-performance `bmoe-server` featuring SSE streaming, dynamic sampling parameters, multi-turn KV reuse, and multi-modal image support.
 
 ---
 
