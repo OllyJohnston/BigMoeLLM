@@ -216,15 +216,18 @@ build/cli/Release/bmoe-cli.exe \
 
 ### Recent Improvements & Milestones
 
-- **Batch Size Support & Submodule Synchronization (`f2141a5`)**: Added `-b` / `--batch` / `--batch-size` flag support to `bmoe-cli` for flexible prompt batching, and synchronized `llama.cpp` upstream submodule for latest architectural fixes.
-- **Windows Console & Telemetry Display (`2de7578`, `4c3005e`)**: Enabled UTF-8 console code page and ANSI Virtual Terminal Processing on Windows; implemented real-time performance telemetry summaries (prompt eval tok/s, decode tok/s, TTFT, and memory bandwidth).
-- **Critical Decode Path Acceleration (`75b531b`)**: Bypassed ARC caching bookkeeping and asynchronous prefetch worker triggers when hot-caching is inactive or when MoE layers are permanently pinned to VRAM, eliminating overhead on dense/MTP models.
-- **Hot-Expert ARC Cache (`68a4678`)**: Integrated Adaptive Replacement Cache (ARC) for hot MoE experts with CUDA staging and VRAM ring buffer management.
-- **High-Priority Polling Threadpool (`dfe3bbb`)**: Integrated a dedicated high-priority CPU worker threadpool with spin-polling to minimize CPU dispatch latency during `--cpu-moe` passes.
-- **Host MMAP Memory Preservation (`724ba68`, `8ea7555`)**: Enforced direct system RAM mmap weight mappings and protected massive models (such as Qwen3.8-Flash-Next and DeepSeek-V4) from VRAM exhaustion by overriding dense gather tables (`per_layer_token_embd`) to host-resident memory.
-- **Zero-Split Hybrid CUDA Graph Capture (`0d5fc7f`, `7776819`)**: Implemented unified CUDA dummy buffer bindings across hybrid CPU/GPU MoE boundaries, eliminating graph splits and enabling continuous CUDA graph reuse on CUDA Stream 0.
-- **KV Cache Quantization & Flash Attention Matrix (`db02fdb`)**: Expanded support for KV cache quantization (`-ctk q8_0`/`q4_0`, `-ctv q8_0`/`q4_0`) and enforced Flash Attention (`-fa`) integration across all supported models.
-- **OpenAI-Compatible Server Engine (`96502a9`)**: Built high-performance `bmoe-server` featuring SSE streaming, dynamic sampling parameters, multi-turn KV reuse, and multi-modal image support.
+- **2026-08-31: Multimodal Projector Offload Control (`c228eac`)**: Added `--no-mmproj-offload` and `--mmproj-offload [on|off]` flags to `bmoe-cli` and `bmoe-server` to keep vision encoder / CLIP weights in host system RAM instead of device VRAM.
+- **2026-08-31: KV Cache Offload Control & Speculative Telemetry (`a684f97`)**: Added `-nkqv` / `--no-offload-kqv` / `--no-kv-offload` flags to keep the KV cache in system RAM; corrected decode rate calculations to true wall-clock time; added MTP / speculative decoding acceptance and draft length rows to the `Generation Statistics` box.
+- **2026-08-31: Experimental Status & Documentation Update (`22ead20`)**: Added experimental project status disclaimer and detailed milestone change history.
+- **2026-08-30: Batch Size Support & Submodule Synchronization (`f2141a5`)**: Added `-b` / `--batch` / `--batch-size` flag support to `bmoe-cli` for flexible prompt batching, and synchronized `llama.cpp` upstream submodule for latest architectural fixes.
+- **2026-08-30: Windows Console & Telemetry Display (`2de7578`, `4c3005e`)**: Enabled UTF-8 console code page and ANSI Virtual Terminal Processing on Windows; implemented real-time performance telemetry summaries (prompt eval tok/s, decode tok/s, TTFT, and memory bandwidth).
+- **2026-08-30: Critical Decode Path Acceleration (`75b531b`)**: Bypassed ARC caching bookkeeping and asynchronous prefetch worker triggers when hot-caching is inactive or when MoE layers are permanently pinned to VRAM, eliminating overhead on dense/MTP models.
+- **2026-08-30: Hot-Expert ARC Cache (`68a4678`)**: Integrated Adaptive Replacement Cache (ARC) for hot MoE experts with CUDA staging and VRAM ring buffer management.
+- **2026-08-30: High-Priority Polling Threadpool (`dfe3bbb`)**: Integrated a dedicated high-priority CPU worker threadpool with spin-polling to minimize CPU dispatch latency during `--cpu-moe` passes.
+- **2026-08-30: Host MMAP Memory Preservation (`724ba68`, `8ea7555`)**: Enforced direct system RAM mmap weight mappings and protected massive models (such as Qwen3.8-Flash-Next and DeepSeek-V4) from VRAM exhaustion by overriding dense gather tables (`per_layer_token_embd`) to host-resident memory.
+- **2026-08-30: Zero-Split Hybrid CUDA Graph Capture (`0d5fc7f`, `7776819`)**: Implemented unified CUDA dummy buffer bindings across hybrid CPU/GPU MoE boundaries, eliminating graph splits and enabling continuous CUDA graph reuse on CUDA Stream 0.
+- **2026-08-30: KV Cache Quantization & Flash Attention Matrix (`db02fdb`)**: Expanded support for KV cache quantization (`-ctk q8_0`/`q4_0`, `-ctv q8_0`/`q4_0`) and enforced Flash Attention (`-fa`) integration across all supported models.
+- **2026-08-30: OpenAI-Compatible Server Engine (`96502a9`)**: Built high-performance `bmoe-server` featuring SSE streaming, dynamic sampling parameters, multi-turn KV reuse, and multi-modal image support.
 
 ---
 

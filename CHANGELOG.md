@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.23.0] - 2026-08-31
+
+### Added
+- **Multimodal Projector Offload Control:** Added `--no-mmproj-offload` and `--mmproj-offload [on|off]` flags to `bmoe-cli` and `bmoe-server` to keep vision encoder / CLIP projector weights in host system RAM instead of device VRAM.
+- **KV Cache Offload Control:** Added `-nkqv` / `--no-offload-kqv` / `--no-kv-offload` flags to keep the KV cache in system RAM (`llama_context_params.offload_kqv = false`).
+- **MTP & Speculative Decoding Telemetry:** Added `Speculative Acceptance` and `Mean Draft Length` metrics rows to the `Generation Statistics` console summary box during speculative runs.
+- **Accurate Wall-Clock Decode Rate:** Corrected decode tokens/sec calculation in `bmoe-server` to measure true cumulative wall-clock time from first generated token to completion.
+
+### Changed
+- **Documentation:** Updated README with experimental status disclaimer, full dated Change History entries, and architecture guides.
+
 ## [0.22.0] - 2026-08-28
 
 ### Added
