@@ -24,7 +24,7 @@ By combining **Hybrid VRAM Pinning**, **Zero-Copy Host MMAP Offloading**, **Cont
 - **64+ tok/s on Consumer GPUs**: Run 35B+ MoE models at interactive speeds on a single RTX 5070 Ti (16 GB VRAM) using hybrid pinned execution.
 - **Hybrid VRAM Pinning (`--n-pinned-layers N`)**: Retain dense attention, normalization layers, and the first $N$ critical MoE blocks in fast GPU VRAM (~8.2 GB), while unpinned experts reside in system RAM or flash.
 - **CUDA Graph Reuse with Fixed Pointers**: Unlike dynamic swappers that break graph capture, unpinned weights maintain fixed memory addresses across forward passes, allowing full CUDA Graph recording and execution on CUDA Stream 0 with near-zero CPU launch latency.
-- **Built-in OpenAI Server (`bmoe-server`)**: Full OpenAI-compatible HTTP API (`/v1/chat/completions` and `/v1/completions`) with SSE streaming, dynamic per-query sampling overrides (`temp`, `top_p`, `min_p`, `top_k`, repetition penalties), multi-turn KV reuse, and multi-modal image support for AnythingLLM, Open WebUI, and custom apps.
+- **Built-in OpenAI Server (`bmoe-server`)**: Full OpenAI-compatible HTTP API (`/v1/chat/completions` and `/v1/completions`) with SSE streaming, dynamic per-query sampling overrides (`temp`, `top_p`, `min_p`, `top_k`, repetition penalties), multi-turn KV reuse, multi-modal image support, and reasoning spans isolated into `reasoning_content` (never leaked into the answer) for AnythingLLM, Open WebUI, and custom apps. Threaded request handling keeps `/v1/models`, `/health` and CORS preflights responsive while another client streams a long generation, and `--api-key` authentication protects non-loopback binds.
 - **Hardware-Adaptive NVMe Streaming (`--moe-stream`)**: For >RAM setups, stream active Top-K expert slices on demand directly from NVMe flash via Win32 / POSIX Direct I/O (`FILE_FLAG_NO_BUFFERING` / `O_DIRECT`) and asynchronous CUDA staging.
 - **Blackwell `sm_120` & Multi-Gen GPU Support**: Built for NVIDIA Blackwell (`compute_120` / `sm_120a`), Ada Lovelace (`sm_89`), Ampere (`sm_86`/`sm_80`), and Apple Silicon / CPU fallback.
 - **KV Cache Quantization & Flash Attention**: Native support for `-ctk q8_0 -ctv q8_0` and `-fa` to cut KV cache VRAM footprint by up to 50%.
@@ -141,6 +141,16 @@ build/cli/Release/bmoe-server.exe \
   -t 12
 ```
 
+> **Concurrency**: each connection runs on its own worker thread. Inference is serialized — a second
+> generation request while one is active returns `HTTP 429` (`"Another generation is in progress; try
+> again shortly"`) instead of blocking, and `/v1/models`, `/health` and CORS `OPTIONS` preflights
+> answer immediately even mid-stream.
+>
+> **Authentication**: binding a non-loopback interface (`--host 0.0.0.0`) without `--api-key` prints a
+> warning. Set `--api-key <secret>` (or `BMOE_SERVER_API_KEY`) to require
+> `Authorization: Bearer <secret>` on every endpoint (CORS `OPTIONS` preflight exempt); requests
+> without a matching key get `HTTP 401`.
+
 ### Server Flags Reference
 
 | Flag | Description | Default |
@@ -167,7 +177,7 @@ build/cli/Release/bmoe-server.exe \
 #### AnythingLLM
 1. Open AnythingLLM Settings -> **AI Providers** -> **Generic OpenAI**.
 2. Set **Base URL** to `http://127.0.0.1:10000/v1`.
-3. Enter any API Key (e.g. `bmoe`).
+3. Enter any API Key (e.g. `bmoe`); if the server runs with `--api-key`, use that exact key.
 4. Select or enter Model Name `bmoe`.
 
 #### Python / OpenAI SDK
@@ -177,7 +187,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:10000/v1",
-    api_key="bmoe"
+    api_key="bmoe"  # any string when the server has no --api-key; otherwise the configured key
 )
 
 response = client.chat.completions.create(
@@ -247,6 +257,7 @@ For custom inference engines and forks, users and downstream tools need clear do
 
 ### Recent Improvements & Milestones
 
+- **2026-08-31: Threaded Server, API-Key Auth & Multi-Turn KV Reuse (`dbc2cdf`)**: `bmoe-server` now serves each connection on its own worker thread (the accept loop no longer blocks for the duration of a stream), serializes generations with a clean `HTTP 429` busy response, and adds `GET /health`. `--api-key` / `BMOE_SERVER_API_KEY` enforces `Authorization: Bearer <secret>` with `HTTP 401` on unauthorized access (CORS `OPTIONS` exempt; non-loopback binds warn when no key is set). Chat requests hand the engine the full `messages` array (`GenerateRequest::messages`, `clear_kv=false`), so the `n_common` prefix match serves a continued conversation from the previous turn's KV cache; reasoning spans are streamed to `delta.reasoning_content` and reported in `message.reasoning_content`, never leaked into `content`. Request parsing moved from hand-rolled string splitting to vendored nlohmann/json (a `}` in a code block no longer truncates a message) with the body cap raised to 64 MiB for multimodal payloads; speculative decoding alongside `temp > 0` is now accepted as heuristic mode (see `docs/mtp.md`).
 - **2026-08-31: Multimodal Projector Offload Control (`c228eac`)**: Added `--no-mmproj-offload` and `--mmproj-offload [on|off]` flags to `bmoe-cli` and `bmoe-server` to keep vision encoder / CLIP weights in host system RAM instead of device VRAM.
 - **2026-08-31: KV Cache Offload Control & Speculative Telemetry (`a684f97`)**: Added `-nkqv` / `--no-offload-kqv` / `--no-kv-offload` flags to keep the KV cache in system RAM; corrected decode rate calculations to true wall-clock time; added MTP / speculative decoding acceptance and draft length rows to the `Generation Statistics` box.
 - **2026-08-31: Experimental Status & Documentation Update (`22ead20`)**: Added experimental project status disclaimer and detailed milestone change history.
