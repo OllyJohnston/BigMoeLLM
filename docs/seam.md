@@ -54,9 +54,13 @@ expert matmuls are running — needs a wait point that no public API exposes. Th
 place where BigMoeOnEdge carries a llama.cpp extension.
 
 **What it is.** A single optional hook, ~25 lines, living on the fork branch
-`bmoe/expert-ready-hook` of `Helldez/llama.cpp` as a single commit on top of the upstream
+`bmoe/expert-ready-hook` of `OllyJohnston/llama.cpp` as a single commit on top of the upstream
 pin. It adds nothing to the model files and changes no data layout; it is a callback the
-CPU MoE kernel invokes.
+CPU MoE kernel invokes. The branch has since grown a small tail of related follow-on commits
+(async host-device copy for the gather, batched readahead, the MTP draft borrow, the qwen4exp
+nextn / NVMe prefetch work, and the multi-token MoE fusion port for speculative decoding) - the
+*seam* itself is still exactly that one hook; everything else on the branch is llama.cpp-side
+performance work that the public API absorbs without touching `core/`.
 
 **Exact API and call site.**
 
@@ -167,15 +171,15 @@ returns. This is how `ggml_backend_sched` implements the eval-callback today
 ## Upgrading llama.cpp
 
 Because the submodule pins the `bmoe/expert-ready-hook` fork branch (section 3), a bump
-rebases that 1-commit branch onto the new upstream tag, re-pushes it, and re-pins:
+rebases the fork branch onto the new upstream tag, re-pushes it, and re-pins:
 
 ```bash
-# in a Helldez/llama.cpp checkout: rebase the single hook commit onto the new tag
+# in an OllyJohnston/llama.cpp checkout: rebase the fork branch onto the new tag
 git fetch upstream && git checkout bmoe/expert-ready-hook
-git rebase <newer-upstream-tag> && git push --force-with-lease origin bmoe/expert-ready-hook
+git rebase <newer-upstream-tag> && git push --force-with-lease olly bmoe/expert-ready-hook
 
 # in this repo: move the submodule to the rebased commit, rebuild, run the gates
-cd third_party/llama.cpp && git fetch origin && git checkout <rebased-commit>
+cd third_party/llama.cpp && git fetch olly && git checkout <rebased-commit>
 cd ../.. && git add third_party/llama.cpp && scripts/build-host.sh
 cd build && ctest --output-on-failure     # gates must stay green
 ```
@@ -193,9 +197,10 @@ output. Each supported architecture adds one more gate to keep green across a bu
 If a future release moves the two hooks (a stable expert-residency API, say) upstream,
 this seam shrinks further or disappears — `core/` does not change.
 
-Pinned submodule at the time of writing: `Helldez/llama.cpp` branch
-`bmoe/expert-ready-hook-b10666`, commit `0e8c83e` — the single expert-ready-hook commit
-(section 3) on top of upstream `ggml-org/llama.cpp` master `4e97ac8` (tag `b10666`, which
-carries the merged Qwen3.8-Flash-Next support). Each bump gets its own fork branch and the
-previous ones stay, so every commit an old pin names remains reachable (see `.gitmodules` /
-`git submodule status` for the current pin).
+Pinned submodule at the time of writing: `OllyJohnston/llama.cpp` branch
+`bmoe/expert-ready-hook`, commit `0fe77575e` - the expert-ready hook (section 3) plus the
+follow-on work described above, on top of upstream `ggml-org/llama.cpp` master (base
+`b10680`, carrying the merged Qwen3.8-Flash-Next support). The branch is pushed to the
+public `OllyJohnston/llama.cpp` fork, so the pin is reachable for any clone of this repo.
+Each bump gets its own fork branch and the previous ones stay, so every commit an old pin
+names remains reachable (see `.gitmodules` / `git submodule status` for the current pin).

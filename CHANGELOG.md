@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.24.0] - 2026-09-01
+
+### Added
+- **CUDA MoE fusion now covers speculative decoding batches (`ggml-cuda`).** Ported upstream
+  `ggml-org/llama.cpp` PR #27621 ("CUDA: extend MOE fusion to specdec", ynankani) to the
+  `bmoe/expert-ready-hook` fork branch, omitting the SWIGLU_CLAMP op (not in the fork's enum
+  set). The fused `mul_mat_vec_q_moe` kernel now fuses the gate/bias/NVFP4 lane-scale and GLU
+  activation into the up projection for multi-token verification batches (N = 2..8) instead of
+  rejecting N > 1 and falling back to the un-fused path; the `topk_moe` router fusion grew from
+  4 to `TOPK_MOE_ROWS_PER_BLOCK` (8) rows per block with an alias barrier so logits may alias
+  the output nodes. This accelerates speculative verification (MTP / n-gram) on MoE
+  architectures - the step that previously re-launched single-token kernels for each draft
+  candidate.
+- **Byte-identity gates extended to the new MoE paths.** `test-backend-ops` now runs
+  unconditional multi-token fusion cases (`m_batch` 2/4/8) plus topk boundary cases at and just
+  past the block limit (`(32,8)/n4`, `(32,8)/n8`, `(32,9)/n8`). On the CUDA backend: 900/900
+  `MUL_MAT_VEC_FUSION` and 416/416 `TOPK_MOE` pass; the three pre-existing streaming-init gate
+  failures (`moe_gates_qwen3moe`/`gemma4`/`split`) are unchanged and unrelated.
+- **Submodule re-pinned to `OllyJohnston/llama.cpp`.** The submodule URL moved from
+  `Helldez/llama.cpp` to the public `OllyJohnston/llama.cpp` fork, which now hosts the full
+  fork branch (`bmoe/expert-ready-hook` @ `0fe77575e`): the expert-ready hook plus the follow-on
+  commits (async copy, batched readahead, MTP draft borrow, qwen4exp nextn / NVMe prefetch
+  work) and the new MoE fusion port, on upstream base `b10680`. `docs/seam.md` updated to match
+  (fork owner, branch contents, pin, and the bump instructions).
+
+### Changed
+- **Engine version 0.24.0.** `project(VERSION)` in `CMakeLists.txt` bumped from 0.22.0, keeping
+  the engine-reported version in step with the changelog.
+
 ## [0.23.0] - 2026-08-31
 
 ### Added
