@@ -22,7 +22,6 @@ SessionConfig session_config_from(const RunConfig & cfg) {
     sc.sampling = cfg.sampling; // greedy by default; opt-in stochastic decoding
     sc.moe = cfg.moe;
     sc.spec = cfg.spec; // self-speculation (MTP head or n-gram lookup); off by default
-    sc.flash_next = cfg.flash_next;
     sc.cache_type_k = cfg.cache_type_k;
     sc.cache_type_v = cfg.cache_type_v;
     sc.flash_attn = cfg.flash_attn;

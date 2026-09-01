@@ -62,7 +62,6 @@ struct SessionConfig {
     // open() builds the wider verify batch, and — for the MTP source only — the draft context.
     // See RunConfig::spec.
     SpecConfig spec;
-    FlashNextConfig flash_next;
 };
 
 

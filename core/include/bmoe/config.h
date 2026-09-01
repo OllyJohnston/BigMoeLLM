@@ -323,14 +323,6 @@ struct SpecConfig {
     bool is_ngram() const { return source == DraftSource::ngram; }
 };
 
-// Qwen3.8-Flash-Next architecture options.
-struct FlashNextConfig {
-    bool enabled = false;
-    bool async_ngram_pager = true;      // async Direct I/O paging for 51B N-gram embedding table
-    bool gdn_recurrent_states = true;   // VRAM state buffers for 3x GDN layers (cuts KV cache by 75%)
-    bool gated_residual_streams = true; // 4-branch parallel residual streams
-};
-
 // A full run: model, prompt, decoding, streaming, telemetry.
 struct RunConfig {
     std::string model_path;
@@ -390,7 +382,6 @@ struct RunConfig {
     SamplingConfig sampling; // greedy by default (temp <= 0); opt-in stochastic decoding
     MoeStreamConfig moe;
     SpecConfig spec; // self-speculative decoding (MTP head or n-gram lookup); off by default
-    FlashNextConfig flash_next;
 };
 
 
