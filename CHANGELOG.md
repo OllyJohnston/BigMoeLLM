@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.25.0] - 2026-09-01
+
+### Added
+- **Qwen3.8-Flash-Next decode attention is now bounded to the indexer-selected cells (QSA
+  gather).** Ported upstream `ggml-org/llama.cpp` PR #27977 ("qwen4exp: reduce the generation
+  slowdown as context grows", serveurperso) to the `bmoe/expert-ready-hook` fork branch. Decode
+  previously masked a full cache-window attention matrix (`kq_mask` filled with `-INF` and the
+  selected rows unmasked), and the only Flash Attention skip is a trailing-cut on the KV-max
+  scan that never fires on decode — so every token walked all `n_kv` K/V tiles. The new
+  `build_qsa_gather` path gathers exactly the selected cells per query (`ggml_get_rows` over the
+  selected cell indices, queries riding the stream axis, mask gathered too) and the dispatch
+  picks it when `flash_attn && 4*n_tps*width < n_kv` (windows that fit a decode graph's compute
+  buffer), falling back to the scan path otherwise. Also: indexer heads summed by slices (no
+  whole-block transpose), the kv-cells used-cell set is a bitmap, and `get_prev_tokens` scans
+  only the n-gram window. Fork `493fe5566`'s existing qwen4exp fixes (seq-set block keying,
+  indexer-key loss on sequence copy, gridDim.y limit) port cleanly underneath, with no conflicts.
+- **QSA decode path verified.** `test-backend-ops` (fork standalone build) passes 900/900
+  `MUL_MAT_VEC_FUSION` and 416/416 `TOPK_MOE` on CUDA, including the topk boundary cases; the
+  recurrent-state rollback regression is byte-identical to the pre-port baseline; the bmoe
+  byte-identity gates remain at 13/16 (the same three pre-existing streaming-init failures,
+  unrelated).
+- **Submodule re-pinned to fork commit `f3ad45b9a`.** `bmoe/expert-ready-hook` now carries the
+  QSA gather port on upstream base `b10680`. `docs/seam.md` updated (branch contents + pin).
+
+### Changed
+- **Engine version 0.25.0.** `project(VERSION)` in `CMakeLists.txt` bumped from 0.24.0, keeping
+  the engine-reported version in step with the changelog.
+
+### Removed
+- **Dead `FlashNextConfig` scaffold removed.** The `flash_next` config block (enabled /
+  async-ngram-pager / GDN-recurrent-states / gated-residual-streams knobs) existed only as
+  copy-plumbing — four references, zero reads, no CLI flag, no test, no doc. All three claimed
+  behaviours already ship elsewhere: the PLE prefetch lives in the fork's arch-guarded NVMe
+  prefetch, the expert-table host residency in `buft_overrides` (`session.cpp`), and the
+  recurrent/multi-turn handling in the fork's `llama-memory-hybrid-idx` layer.
+
 ## [0.24.0] - 2026-09-01
 
 ### Added
