@@ -312,7 +312,11 @@ bytes: the mechanical floor the cache must be able to stage) and `loop_overhead_
 actually cost — `tokens / mtp_decodes` is the amortisation achieved) and `mtp_draft_s/tok=<s>` (what
 that amortisation cost outside the decode, which `s/tok` and `tok/s` both exclude) and
 `drafted_steps=<n>` (how many steps drafted at all — below `mtp_decodes` only for `--ngram`, which
-abstains); see the `io_ms`
+abstains). With `--spec-mtp-cr-depth` engaged, `mtp_ckpt_saves=<n>` (partial recurrent-state
+checkpoints taken, only on drafts deeper than the retained snapshots), `mtp_replays=<n>` (deep
+rejections that restored the checkpoint and re-decoded the accepted prefix — one extra decode
+each) and `mtp_host_fallback=<n>` (device checkpoint saves that fell back to host storage)
+report how often the compact-rollback paths fired; see the `io_ms`
 note above for how the read-time columns are reinterpreted under overlap. The route-ahead keys `ra_committed`,
 `ra_passthrough`, `ra_agree_pct`, `ra_gemv_ms/tok`, `ra_issue_ms/tok` and `ra_wd_ms/tok` mirror the
 CLI's `moe-route-ahead:` report ([route-ahead.md](route-ahead.md)); `drain_s/tok` / `adopt_s/tok`
@@ -475,7 +479,9 @@ BMOE_DONE  {"id":<int>,"cancelled":<bool>,"tokens":<int>,"tok_s":<float>,
             "cache_resident_mib":<float>,"cache_budget_mib":<float>,"read_mib":<float>,
             "stall_s_tok":<float>,"mgmt_s_tok":<float>,"majflt_tok":<float>,"cpu_s_tok":<float>,
             "token_demand_mib":<float>,"mtp_drafted":<int>,"mtp_accepted":<int>,"mtp_decodes":<int>,
-            "mtp_draft_s_tok":<float>,"drafted_steps":<int>,"loop_overhead_s_tok":<float>,
+            "mtp_draft_s_tok":<float>,"drafted_steps":<int>,
+            "mtp_ckpt_saves":<int>,"mtp_replays":<int>,"mtp_host_fallback":<int>,
+            "loop_overhead_s_tok":<float>,
             "reasoning":"<string>","text":"<string>"}
 BMOE_ERROR {"id":<int>,"fatal":<bool>,"msg":"<string>"}
 ```

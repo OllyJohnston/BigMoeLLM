@@ -443,6 +443,15 @@ struct Session::Impl {
     // cannot be split between the widened verify union on the trunk and the head's own routing,
     // which are attacked in completely different ways.
     uint64_t mtp_draft_read_bytes = 0;
+    // Compact Rollback (n_rs_seq < draft_max). The partial recurrent-state checkpoint taken before
+    // a verify batch, restored when the rejection outruns the retained depth; plus the device
+    // buffers it snapshots into (reserved once at open() so the first save does not reallocate),
+    // and the counters that say whether the machinery earned its extra decodes.
+    common_prompt_checkpoint cr_ckpt;
+    bool cr_reserved = false; // device checkpoint buffers reserved (or attempted and fell back)
+    long long mtp_replays = 0;    // deep rejections that restored the checkpoint and re-decoded
+    long long mtp_ckpt_saves = 0; // checkpoints actually taken (deep drafts only)
+    long long mtp_host_fallback = 0; // times an ON_DEVICE save fell back to host storage
 
     const llama_vocab * vocab = nullptr;
     int n_vocab = 0;
@@ -729,7 +738,15 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (cfg.spec.enabled()) cparams.n_rs_seq = (uint32_t) cfg.spec.draft_max;
+    // The target keeps n_rs_seq recurrent snapshots for native rollback. Compact Rollback maps it
+    // to the configured depth (cr_depth in [0, draft_max)); -1 (default) keeps the historical
+    // mapping to the full draft width, so every rejection rolls back natively and no checkpoint is
+    // ever taken. The draft context never rolls back (see below), so it stays at 0.
+    if (cfg.spec.enabled()) {
+        cparams.n_rs_seq = cfg.spec.is_mtp() && cfg.spec.cr_depth >= 0
+                               ? (uint32_t) cfg.spec.cr_depth
+                               : (uint32_t) cfg.spec.draft_max;
+    }
     cparams.offload_kqv = !cfg.no_kv_offload;
 
 #if defined(BMOE_HAVE_CUDA)
@@ -749,6 +766,21 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         llama_set_n_threads(ctx, cfg.n_threads, cfg.n_threads);
     }
     std::fprintf(stderr, "llama threadpool init, n_threads = %d (poll=100, prio=HIGH)\n", cfg.n_threads);
+
+    // Compact Rollback's device checkpoint buffers are reserved NOW, before any evaluation can
+    // consume the headroom they live in. upstream reserves them right after context creation for
+    // exactly this reason; on this engine the capture warm-up below is the first decode, and the
+    // expert-cache budget is sized against what the fitted context reports afterwards. ON_DEVICE
+    // saves are a fast path, not a requirement — reserve() only trusts a success, and every save
+    // falls back to host storage if the device path fails.
+    im.cr_reserved = false;
+    if (cfg.spec.is_mtp() && cfg.spec.cr_depth >= 0) {
+        im.cr_reserved = llama_state_seq_reserve_device_buffers(ctx);
+        if (!im.cr_reserved) {
+            std::fprintf(stderr, "[bmoe] warning: device recurrent checkpoint reservation failed; "
+                                 "using host checkpoints for MTP compact rollback\n");
+        }
+    }
 
     // The MTP draft context: same model, same eval callback, but ctx_type = MTP so llama.cpp builds
     // the nextn graph. It keeps its own (single-position) KV, hence n_rs_seq = 0 — nothing is ever
@@ -809,6 +841,14 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         // width becomes adaptive per step. See SpecConfig::draft_p_min for why that pays twice on a
         // streamed device.
         sp.draft.p_min = cfg.spec.draft_p_min;
+        // MTP Compact Rollback depth. -1 (the default) keeps n_rs_seq == n_max, so the engine
+        // never takes a checkpoint; a cr_depth >= 0 shrinks the recurrent snapshot table and the
+        // loop replays past it on deep rejection (see the accept block). The driver's own
+        // n_rs_seq is what need_n_rs_seq() reads when it sizes the recurrent tensors.
+        sp.draft.n_rs_seq = cfg.spec.cr_depth;
+        // Size each draft from measured acceptance instead of always drafting n_max. Off by
+        // default; see SpecConfig::draft_adaptive.
+        sp.draft.adaptive = cfg.spec.draft_adaptive;
         sp.draft.ctx_tgt = ctx; // self-speculation: one model, two contexts over it
         sp.draft.ctx_dft = im.ctx_dft.get();
         im.mtp.reset(common_speculative_init(sp, /*n_seq*/ 1));
@@ -1536,6 +1576,26 @@ RunResult Session::generate(const GenerateRequest & req,
             step = llama_batch_get_one(&tok, 1);
         }
 
+        // Compact Rollback checkpoint, taken only when the draft is DEEP ENOUGH to need it. A
+        // rejection can roll back natively while it stays within the snapshots (n_rs_seq positions,
+        // cr_depth), so a shorter draft never restores — and never pays for a save. The checkpoint
+        // captures the recurrent-state cells for the committed history only (PARTIAL_ONLY skips the
+        // attention KV, which the replay re-derives position by position); ON_DEVICE snapshots into
+        // the buffers reserved at open() and falls back to host storage when the device path cannot
+        // serve. pos_min/pos_max are the committed memory range this save describes: everything at
+        // or above n_past is about to be overwritten by the verify decode, so the restore point is
+        // exactly the state before it.
+        if (mtp_on && n_draft > (llama_pos) llama_n_rs_seq(ctx)) {
+            const auto ck0 = clock_t_::now();
+            im.cr_ckpt.update_pos((int64_t) mtp_ctx.size(), /*pos_min*/ 0, /*pos_max*/ n_past - 1);
+            llama_state_seq_flags ckpt_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            if (im.cr_reserved) ckpt_flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+            im.cr_ckpt.update_tgt(ctx, /*seq*/ 0, ckpt_flags);
+            ++im.mtp_ckpt_saves;
+            if (im.cr_reserved && !im.cr_ckpt.data_tgt_on_device) ++im.mtp_host_fallback;
+            draft_s += secs(ck0, clock_t_::now());
+        }
+
         // Bracket ONLY the decode: major faults and CPU-time deltas here decompose this token's
         // compute residual into flash-fault stalls vs. genuine (or throttled) computation.
         const uint64_t f0 = pio::major_faults();
@@ -1611,13 +1671,37 @@ RunResult Session::generate(const GenerateRequest & req,
             }
             im.mtp_draft_seconds += draft_s;
 
-            // Drop the rejected tail from the target; the bounded-rollback snapshots asked for at
-            // context creation are what make this a restore rather than a replay. The draft context
-            // needs no rollback of its own — it was never given the tail.
-            if (n_acc < n_draft) {
-                const llama_pos keep = n_past + 1 + n_acc;
-                if (!llama_memory_seq_rm(llama_get_memory(ctx), /*seq*/ 0, keep, -1))
-                    return fail("failed to roll back the rejected draft tokens from the KV cache");
+            // Drop the rejected tail from the target. The bounded-rollback snapshots asked for at
+            // context creation handle the shallow case natively; a deep rejection that outruns
+            // them restores the Compact Rollback checkpoint and replays the accepted prefix in one
+            // extra decode. The draft context is already caught up (above), so it holds the
+            // accepted prefix and needs nothing. MTP only: the n-gram source never takes a
+            // checkpoint (no draft-side recurrent state), and its cr_depth is -1 by validation.
+            if (mtp_on && n_acc < n_draft) {
+                const llama_pos n_rollback = n_draft - n_acc;
+                const llama_pos n_rs = (llama_pos) llama_n_rs_seq(ctx);
+                if (n_rollback > n_rs) {
+                    // deep rejection: restores the checkpoint, replays the accepted prefix
+                    im.cr_ckpt.load_tgt(ctx, /*seq*/ 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    const auto r0 = clock_t_::now();
+                    ++im.mtp_decodes;
+                    batch_fill(im.mtp_batch, confirmed.data(), (int) confirmed.size(), n_past, /*all_logits*/ true);
+                    int rdec = llama_decode(ctx, im.mtp_batch);
+                    if (rdec != 0) {
+                        if (im.cancel_requested.load(std::memory_order_relaxed)) {
+                            res.cancelled = true;
+                            break;
+                        }
+                        if (moe.overlap && im.source.fatal()) return fail("expert stream I/O failed during repla decode");
+                        return fail("decode failed during compact rollback repla");
+                    }
+                    gen_seconds += secs(r0, clock_t_::now());
+                    ++im.mtp_replays;
+                } else {
+                    const llama_pos keep = n_past + 1 + n_acc;
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx), /*seq*/ 0, keep, -1))
+                        return fail("failed to roll back the rejected draft tokens from the KV cache");
+                }
             }
             if (mtp_on) common_speculative_accept(im.mtp.get(), /*seq*/ 0, (uint16_t) n_acc);
         }
@@ -1760,6 +1844,9 @@ RunResult Session::generate(const GenerateRequest & req,
     s.drafted_steps = im.drafted_steps - mtp0_drafted_steps;
     s.mtp_draft_s_per_token = n_gen > 0 ? (im.mtp_draft_seconds - mtp0_draft_s) / n_gen : 0.0;
     s.mtp_draft_read_mib = (double) (im.mtp_draft_read_bytes - mtp0_draft_bytes) / (1024.0 * 1024.0);
+    s.mtp_replays = im.mtp_replays; // cr_depth defaults off; both count from 0 on a session
+    s.mtp_ckpt_saves = im.mtp_ckpt_saves;
+    s.mtp_host_fallback = im.mtp_host_fallback;
     if (moe.predict_log) {
         // Session totals, not a per-generation delta: these are an accuracy estimate, and every
         // turn's routings are equally valid samples of it. See RunSummary.

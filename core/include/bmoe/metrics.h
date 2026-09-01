@@ -198,6 +198,16 @@ struct RunSummary {
     // completely different fixes. The route trace cannot see it: its framing brackets the target
     // decode, and the head only ever runs in the draft context.
     double mtp_draft_read_mib = 0.0;
+    // Compact Rollback (zero when SpecConfig::cr_depth is -1 / off). Deep rejections that outran
+    // the retained recurrent snapshots: each restore + replay is one extra decode with no new
+    // tokens (it lands in mtp_decodes too, so the amortisation ratio shows it). ckpt_saves is how
+    // many partial recurrent-state checkpoints were actually taken (deep drafts only) and
+    // host_fallback how many of those had to use host storage instead of the reserved device
+    // buffers — the ratio of the two is how often the device path the memory was reserved for is
+    // not the one that served.
+    long long mtp_replays = 0;
+    long long mtp_ckpt_saves = 0;
+    long long mtp_host_fallback = 0;
 
     // Expert-prediction accuracy (all zero unless MoeStreamConfig::predict_log). `predict_stale` is
     // the next layer's routing ranked a layer early, `predict_prev` the previous token's routing —

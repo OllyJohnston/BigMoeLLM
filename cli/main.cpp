@@ -331,14 +331,17 @@ static int run_session_loop(const RunConfig & cfg,
                     "\"compute_s_tok\":%.4f,\"io_s_tok\":%.4f,\"cache_resident_mib\":%.0f,\"cache_budget_mib\":%.0f,"
                     "\"read_mib\":%.1f,\"stall_s_tok\":%.4f,\"mgmt_s_tok\":%.4f,\"majflt_tok\":%.2f,\"cpu_s_tok\":%.4f,"
                     "\"token_demand_mib\":%.1f,\"mtp_drafted\":%lld,\"mtp_accepted\":%lld,\"mtp_decodes\":%lld,"
-                    "\"mtp_draft_s_tok\":%.4f,\"drafted_steps\":%lld,\"loop_overhead_s_tok\":%.4f,"
+                    "\"mtp_draft_s_tok\":%.4f,\"drafted_steps\":%lld,"
+                    "\"mtp_ckpt_saves\":%lld,\"mtp_replays\":%lld,\"mtp_host_fallback\":%lld,"
+                    "\"loop_overhead_s_tok\":%.4f,"
                     "\"reasoning\":\"%s\",\"text\":\"%s\"}\n",
                     cmd.id, r.cancelled ? "true" : "false", s.n_generated, s.tokens_per_second, s.prefill_seconds,
                     (s.prefill_seconds > 0 ? s.n_prompt / s.prefill_seconds : 0.0), s.load_seconds, s.cache_hit_pct,
                     s.n_prompt, s.n_past, s.moe_compute_s_per_token, s.moe_io_s_per_token, s.cache_resident_mib,
                     s.cache_budget_mib, s.moe_read_mib, s.moe_stall_s_per_token, s.moe_mgmt_s_per_token,
                     s.majflt_per_token, s.cpu_s_per_token, s.token_demand_mib, s.mtp_drafted, s.mtp_accepted,
-                    s.mtp_decodes, s.mtp_draft_s_per_token, s.drafted_steps, s.loop_overhead_s_per_token,
+                    s.mtp_decodes, s.mtp_draft_s_per_token, s.drafted_steps,
+                    s.mtp_ckpt_saves, s.mtp_replays, s.mtp_host_fallback, s.loop_overhead_s_per_token,
                     json_escape(r.reasoning_text).c_str(), json_escape(r.generated_text).c_str());
         std::fflush(stdout);
     }
@@ -416,6 +419,13 @@ static void print_usage(const char * argv0) {
         "                          however unsure it is). Makes the draft width adaptive per step:\n"
         "                          a draft not made is one fewer MTP-block pass AND one fewer\n"
         "                          independently routed position in the verify batch\n"
+        "      --spec-mtp-cr-depth N  --mtp only: MTP Compact Rollback depth (default -1 = off, full\n"
+        "                          native rollback). In [0, draft_max-1]; a rejection deeper than N\n"
+        "                          restores a partial recurrent-state checkpoint and replays the\n"
+        "                          accepted prefix in one extra decode, shrinking the KV snapshots\n"
+        "                          the context reserves\n"
+        "      --spec-draft-adaptive  size each draft from measured acceptance instead of always\n"
+        "                          drafting --draft tokens (MTP; off by default)\n"
         "      --ngram-min-match N --ngram only: shortest run of matching tokens allowed to draft\n"
         "                          (default 3). The confidence gate: raise it for fewer, better\n"
         "                          drafts, lower it for coverage\n"
@@ -633,6 +643,10 @@ int main(int argc, char ** argv) {
             cfg.spec.draft_max = std::atoi(next("--draft"));
         else if (a == "--mtp-p-min")
             cfg.spec.draft_p_min = (float) std::atof(next("--mtp-p-min"));
+        else if (a == "--spec-mtp-cr-depth")
+            cfg.spec.cr_depth = std::atoi(next("--spec-mtp-cr-depth"));
+        else if (a == "--spec-draft-adaptive")
+            cfg.spec.draft_adaptive = true;
         else if (a == "--ngram-min-match")
             cfg.spec.ngram_min_match = std::atoi(next("--ngram-min-match"));
         else if (a == "-ctk" || a == "--cache-type-k")
@@ -896,6 +910,13 @@ int main(int argc, char ** argv) {
                         "%.1f MiB the widened verify batch\n",
                         s.moe_read_mib, s.mtp_draft_read_mib, 100.0 * s.mtp_draft_read_mib / s.moe_read_mib,
                         s.moe_read_mib - s.mtp_draft_read_mib);
+        }
+        // Compact rollback: checkpoints taken, how many deep rejections replayed them, and cache
+        // misses that fell back to host storage. Zero on the default cr_depth=-1 (no checkpoint
+        // machinery); the numbers are what the flag buys at the chosen depth.
+        if (cfg.spec.is_mtp() && cfg.spec.cr_depth >= 0) {
+            std::printf("mtp-cr: depth %d, %lld checkpoints, %lld replays (%lld host fallback)\n",
+                        cfg.spec.cr_depth, s.mtp_ckpt_saves, s.mtp_replays, s.mtp_host_fallback);
         }
     }
     if (s.n_prompt > 0) {

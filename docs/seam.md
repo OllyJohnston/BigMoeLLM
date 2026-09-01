@@ -198,9 +198,12 @@ If a future release moves the two hooks (a stable expert-residency API, say) ups
 this seam shrinks further or disappears — `core/` does not change.
 
 Pinned submodule at the time of writing: `OllyJohnston/llama.cpp` branch
-`bmoe/expert-ready-hook`, commit `0fe77575e` - the expert-ready hook (section 3) plus the
+`bmoe/expert-ready-hook`, commit `066fc8859` - the expert-ready hook (section 3) plus the
 follow-on work described above, on top of upstream `ggml-org/llama.cpp` master (base
-`b10680`, carrying the merged Qwen3.8-Flash-Next support). The branch is pushed to the
-public `OllyJohnston/llama.cpp` fork, so the pin is reachable for any clone of this repo.
-Each bump gets its own fork branch and the previous ones stay, so every commit an old pin
-names remains reachable (see `.gitmodules` / `git submodule status` for the current pin).
+`b10680`, carrying the merged Qwen3.8-Flash-Next support), extended with the multi-token MoE
+fusion port (PR #27621 minus SWIGLU_CLAMP; see CHANGELOG 0.24.0) and the MTP compact-rollback /
+adaptive-draft port (`--spec-mtp-cr-depth`, `--spec-draft-adaptive`; see `docs/mtp.md`). The
+branch is pushed to the public `OllyJohnston/llama.cpp` fork, so the pin is reachable for any
+clone of this repo. Each bump gets its own fork branch and the previous ones stay, so every
+commit an old pin names remains reachable (see `.gitmodules` / `git submodule status` for the
+current pin).

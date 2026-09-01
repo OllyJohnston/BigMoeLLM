@@ -423,6 +423,15 @@ static void print_lmstudio_telemetry(const RunSummary & sum, double ttft_ms, dou
         std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
     }
 
+    // Compact Rollback (only when checkpoints were taken; zero on the cr_depth=-1 default)
+    if (sum.mtp_ckpt_saves > 0) {
+        std::snprintf(lbuf, sizeof(lbuf), "Compact Rollback");
+        std::snprintf(rbuf, sizeof(rbuf), "%lld ckpts, %lld replays, %lld host fb",
+                      (long long) sum.mtp_ckpt_saves, (long long) sum.mtp_replays,
+                      (long long) sum.mtp_host_fallback);
+        std::fprintf(stderr, "│ %-28s │ %-28s │\n", lbuf, rbuf);
+    }
+
     // Total Response Time
     int total_tokens = sum.n_prompt + sum.n_generated;
     std::snprintf(lbuf, sizeof(lbuf), "Total Response Time");
@@ -834,7 +843,7 @@ static void print_usage(const char * argv0) {
                 "  --prefetch, --predict-prefetch, --drop-cold-experts,\n"
                 "  --overlap, --io-two-wave, --route-ahead,\n"
                 "  --temp, --top-k, --top-p, --seed,\n"
-                "  --mtp, --ngram, --draft, --mtp-p-min, --ngram-min-match,\n"
+                "  --mtp, --ngram, --draft, --mtp-p-min, --spec-mtp-cr-depth, --spec-draft-adaptive, --ngram-min-match,\n"
                 "  --n-expert-used, --load-all\n"
                 "  --no-think           disable model thinking\n"
                 "\n"
@@ -969,6 +978,10 @@ int main(int argc, char ** argv) {
             cfg.spec.draft_max = std::atoi(next("--draft"));
         else if (a == "--mtp-p-min")
             cfg.spec.draft_p_min = (float) std::atof(next("--mtp-p-min"));
+        else if (a == "--spec-mtp-cr-depth")
+            cfg.spec.cr_depth = std::atoi(next("--spec-mtp-cr-depth"));
+        else if (a == "--spec-draft-adaptive")
+            cfg.spec.draft_adaptive = true;
         else if (a == "--ngram-min-match")
             cfg.spec.ngram_min_match = std::atoi(next("--ngram-min-match"));
         else if (a == "-ctk" || a == "--cache-type-k")

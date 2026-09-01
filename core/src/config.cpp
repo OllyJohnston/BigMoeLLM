@@ -70,6 +70,17 @@ ValidationResult validate(const RunConfig & cfg) {
     if (cfg.spec.is_mtp() && (cfg.spec.draft_p_min < 0.0f || cfg.spec.draft_p_min > 1.0f)) {
         return fail("spec.draft_p_min must be in [0, 1]");
     }
+    // Compact Rollback only makes sense below the draft width: at cr_depth >= draft_max every
+    // rejection rolls back natively and the checkpoint machinery never fires (and at -1 it is off),
+    // so the value would be indistinguishable from the default except for the memory reserved. 0 is
+    // accepted (n_rs_seq = 0, no snapshots) but find the user who means it — the flag would then
+    // replay on ANY rejection, turning every deep draft rollback into two decodes.
+    if (cfg.spec.is_mtp() && cfg.spec.cr_depth != -1 &&
+        (cfg.spec.cr_depth < 0 || cfg.spec.cr_depth >= cfg.spec.draft_max)) {
+        return fail("spec.cr_depth must be in [0, " + std::to_string(cfg.spec.draft_max - 1) +
+                    "] (MTP Compact Rollback depth) or -1 (off = native rollback to the full draft "
+                    "width); a value at or above draft_max would never engage.");
+    }
     // Both of these are source-specific knobs. Accepting one against the other source would silently
     // do nothing, which is exactly the class of "the flag was ignored" bug this validation exists to
     // prevent — the caller asked for a behaviour the chosen source does not have.
@@ -77,6 +88,10 @@ ValidationResult validate(const RunConfig & cfg) {
         return fail("spec.draft_p_min is an MTP knob (the head's own confidence in its proposal) and has "
                     "no meaning for the n-gram source, which has no probabilities — its confidence gate "
                     "is spec.ngram_min_match.");
+    }
+    if (cfg.spec.is_ngram() && cfg.spec.cr_depth != -1) {
+        return fail("spec.cr_depth is an MTP knob (the recurrent-state rollback depth) and has no "
+                    "meaning for the n-gram source, which keeps no draft-side state to compact.");
     }
     if (cfg.spec.is_ngram() &&
         (cfg.spec.ngram_max_match < 1 || cfg.spec.ngram_max_match > SpecConfig::ngram_match_limit)) {

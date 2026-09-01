@@ -297,6 +297,24 @@ struct SpecConfig {
     // making every step scan its full length for no additional selectivity.
     int ngram_max_match = 12;
 
+    // MTP only. Compact Rollback depth: how many of the trailing positions of a verify batch the
+    // target context can roll back natively (per-token recurrent snapshots). When a rejection
+    // outruns this, the engine restores a partial recurrent-state checkpoint taken before the
+    // batch and replays the accepted prefix — 1 extra decode only when the draft was confidently
+    // wrong past the retained depth.
+    //
+    // -1 (the default) keeps the historical mapping n_rs_seq = draft_max: every rejection rolls
+    // back natively, no checkpoint, no replay, no extra decode. 0 is off for MTP (n_rs_seq = 0).
+    // Set it below draft_max to trade a small expected replay cost for a smaller recurrent
+    // snapshot table. See docs/mtp.md.
+    int cr_depth = -1;
+
+    // MTP only (all sources when the llama.cpp driver honours it). Size each draft from measured
+    // acceptance instead of always drafting draft_max: after two consecutive ceiling-reaching
+    // drafts with no full acceptance the width backs off, and a full acceptance raises it again.
+    // Off by default — the scheduled width is the known-good steady state. See SpecConfig::draft_max.
+    bool draft_adaptive = false;
+
     static constexpr int draft_max_limit = 8;
     static constexpr int ngram_match_limit = 64;
 

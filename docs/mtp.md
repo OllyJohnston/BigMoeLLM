@@ -180,8 +180,8 @@ same rule the rest of the engine follows ([seam.md](seam.md)).
 
 Self-speculation means one model and two contexts over it:
 
-- the **target** context, created with `n_rs_seq = --draft` so a rejected tail is rewound from a
-  bounded snapshot instead of replayed;
+- the **target** context, created with `n_rs_seq = --draft` (or `--spec-mtp-cr-depth`, see below) so a
+  rejected tail is rewound from a bounded snapshot instead of replayed;
 - the **draft** context, created with `ctx_type = LLAMA_CONTEXT_TYPE_MTP` so llama.cpp builds the
   nextn graph, and carrying the **same eval callback** as the target — the router hook is per-context,
   not per-model.
@@ -224,6 +224,42 @@ The saving is small on a host, where that block is one layer of arithmetic. It i
 streamed device: **the MTP block carries its own MoE FFN**, so every skipped position is a routing
 that no longer happens and a set of expert slices that no longer has to be read. At draft 3 with
 acceptance around 60%, roughly one position per group stops being computed and streamed.
+
+## Compact Rollback (`--spec-mtp-cr-depth`)
+
+The native rollback above is a **snapshot table**: the target context keeps `n_rs_seq` recurrent-state
+snapshots of the trailing positions, and a rejection rewinds from one when it stays within reach.
+By default `n_rs_seq = draft_max`, so every conceivable rejection rolls back natively — no extra
+decode, no checkpoint, ever.
+
+Each snapshot is a full copy of the hybrid model's recurrent cells (the S state, which dominates the
+memory), so the table's size scales linearly with `draft_max`. On a hybrid model whose S state is
+large, that is real memory — measured on a 35B-A3B at ~63 MiB per snapshot (the recurrent memory is
+125.62 MiB at n_rs_seq=1 and 251.25 MiB at n_rs_seq=3 — a straight halving of the table). **Compact
+Rollback trades a smaller table for a rare extra decode:**
+
+- `--spec-mtp-cr-depth N` (MTP only, `0 <= N < draft_max`) sets `n_rs_seq = N`. A rejection that
+  rolls back **within** the retained snapshots still does so natively, exactly as before.
+- A rejection **deeper** than `N` cannot be rewound from a snapshot. The engine instead restores a
+  partial recurrent-state checkpoint taken before the batch (attention KV is not saved — the replay
+  re-derives it position by position) and re-decodes the accepted prefix, which requires the target
+  logits that are already in hand. One extra decode for the whole group, whatever the depth.
+- A checkpoint is taken **only when the draft is deeper than `N`** — a draft that can never need the
+  restore never pays for a save. On the default (`-1`, or `cr_depth >= draft_max`), no checkpoint is
+  ever taken, so a CR flag is a no-op on the historical path.
+- The checkpoint save is `ON_DEVICE` (memcpy within VRAM) when the buffers could be reserved at
+  context creation, with automatic fallback to host storage when the device path cannot serve — the
+  telemetry line reports `host fb` for how often that happened.
+
+The trade-off is entirely about draft depth: with `N=1`, roughly half the deep drafts on a 35B-A3B
+prompt triggered a replay (measured 96/211 over a 400-token generation), each an extra decode. `N=2`
+halves that; `N=draft_max-1` keeps the replay path for only the deepest rejections. In exchange the
+recurrent memory falls from 3 snapshots to `N`. As with every memory knob on this engine, the right
+`N` is the one whose replay cost fits the device's balance between VRAM and decode throughput.
+
+The counters live in the summary (`--progress` JSON and the server telemetry table): `mtp_ckpt_saves`
+(checkpoints taken), `mtp_replays` (deep rejections that restored and re-decoded), `mtp_host_fallback`
+(device saves that fell back to host).
 
 ## Reading the numbers
 

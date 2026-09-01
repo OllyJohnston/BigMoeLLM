@@ -268,6 +268,33 @@ int main() {
         expect_ok("sampling without speculation stays valid", c);
     }
 
+    // MTP Compact Rollback: a depth is only meaningful below the draft width, and the
+    // adaptive-draft flag is MTP-only.
+    {
+        RunConfig c = ok_base();
+        c.spec.source = DraftSource::mtp;
+        c.spec.cr_depth = -1;
+        expect_ok("cr_depth -1 (off, native rollback) is the default and valid", c);
+        c.spec.cr_depth = 1;
+        expect_ok("cr_depth inside the draft width is valid", c);
+        c.spec.cr_depth = 0;
+        expect_ok("cr_depth 0 (replay on any rejection) is valid", c);
+        c.spec.cr_depth = 2; // draft_max is 3, so 2 == draft_max-1 is the deepest engaged value
+        expect_ok("cr_depth draft_max-1 (the deepest compact value) is valid", c);
+        c.spec.cr_depth = 3;
+        expect_fail("cr_depth == draft_max is rejected: it would reserve checkpoint buffers that "
+                    "never fire (the -1 default already gives native rollback to the full width)",
+                    c);
+        c.spec.cr_depth = 4;
+        expect_fail("cr_depth above draft_max is rejected", c);
+        c.spec.cr_depth = -2;
+        expect_fail("cr_depth below -1 is rejected", c);
+        c.spec.cr_depth = -1;
+        c.spec.draft_adaptive = true;
+        expect_ok("adaptive draft sizing is valid with MTP", c);
+        c.spec.draft_adaptive = false;
+    }
+
     // The n-gram source: the same shared rules, plus its own gate, and no cross-talk with the
     // MTP-only knob — a flag the chosen source cannot act on is rejected, not silently ignored.
     {
@@ -280,6 +307,10 @@ int main() {
         c.spec.draft_max = SpecConfig::draft_max_limit + 1;
         expect_fail("the draft-width limit applies to the n-gram source too", c);
         c.spec.draft_max = 3;
+        c.spec.cr_depth = 1;
+        expect_fail("compact rollback is rejected with the n-gram source (it has no draft-side "
+                    "recurrent state to compact)", c);
+        c.spec.cr_depth = -1;
         c.spec.draft_p_min = 0.6f;
         expect_fail("the MTP confidence floor is rejected with the n-gram source", c);
         c.spec.draft_p_min = 0.0f;

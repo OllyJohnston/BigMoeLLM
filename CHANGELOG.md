@@ -28,6 +28,16 @@ Semantic Versioning.
   commits (async copy, batched readahead, MTP draft borrow, qwen4exp nextn / NVMe prefetch
   work) and the new MoE fusion port, on upstream base `b10680`. `docs/seam.md` updated to match
   (fork owner, branch contents, pin, and the bump instructions).
+- **MTP Compact Rollback (`--spec-mtp-cr-depth`).** Ported the standalone compact-rollback +
+  adaptive-draft change onto the `bmoe/expert-ready-hook` fork and wired it through the engine.
+  The target context's recurrent snapshot table is sized `n_rs_seq = --draft` by default (every
+  rejection rolls back natively); `--spec-mtp-cr-depth N` shrinks it to `N`, and a rejection
+  deeper than `N` restores a partial recurrent-state checkpoint (ON_DEVICE, host fallback
+  reported) and re-decodes the accepted prefix in one extra decode. Measured on a 35B-A3B MTP
+  model: recurrent memory 251.25 MiB (n_rs_seq=3) -> 62.5 MiB/snapshot, with ~half of deep
+  drafts at `N=1` taking the replay path. `--spec-draft-adaptive` additionally sizes each draft
+  from measured acceptance instead of always drafting the full width. New summary counters
+  `mtp_ckpt_saves` / `mtp_replays` / `mtp_host_fallback`.
 
 ### Changed
 - **Engine version 0.24.0.** `project(VERSION)` in `CMakeLists.txt` bumped from 0.22.0, keeping
