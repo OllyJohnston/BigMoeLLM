@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.26.0] - 2026-09-01
+
+### Added
+- **Batched grid-IQ panel GEMM for CPU prefill (`ggml-cpu`).** Ported upstream
+  `ggml-org/llama.cpp` PR #27402 ("AVX2: speed up large batch prompt processing of IQ models")
+  to the `bmoe/expert-ready-hook` fork branch. New `iqp.cpp` / `iqp.h` decode 8 src0 rows at a
+  time into per-thread int8 panels (`block_iqp_x8`) and run an integer GEMM against all src1
+  columns, for the importance-matrix quantized types (IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S,
+  IQ4_XS/NL). Upstream measures up to 8-10x faster CPU prompt processing at large batch sizes
+  and ~2x on CPU MoE layers. `ggml_compute_forward_mul_mat` and `_mul_mat_id` dispatch to the
+  panel path after the src1->q8_K barrier when the batch is large enough
+  (`GGML_IQP_MIN_BATCH` / `_ID = 8`); single-token decode (N = 1) is untouched, keeping the
+  lightweight GEMV path for autoregressive latency. The per-expert `mul_mat_id` dispatch sits
+  after the expert-ready hook, so the streamer's residency block still fires on both paths.
+  `ggml_graph_plan` reserves one scratch panel per thread. An A/B escape hatch
+  (`GGML_NO_IQ_PANEL` env var) disables the path without a rebuild.
+- **IQP path verified.** `test-backend-ops` passes 883/883 `MUL_MAT` + `MUL_MAT_ID` on the CPU
+  (AVX2) backend, including the new 10-row-batch IQP coverage for every grid IQ type. The
+  CUDA0 topk/fusion suites are unchanged (416/416); the bmoe byte-identity gates remain 13/16
+  (the same three pre-existing streaming-init failures, unrelated).
+- **Submodule re-pinned to fork commit `d5e576b6`.** `bmoe/expert-ready-hook` now carries the
+  IQP panel GEMM, still on upstream base `b10680`. `docs/seam.md` updated (branch contents +
+  pin).
+
+### Changed
+- **Engine version 0.26.0.** `project(VERSION)` in `CMakeLists.txt` bumped from 0.25.0, keeping
+  the engine-reported version in step with the changelog.
+
 ## [0.25.0] - 2026-09-01
 
 ### Added

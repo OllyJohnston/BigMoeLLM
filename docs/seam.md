@@ -59,8 +59,9 @@ pin. It adds nothing to the model files and changes no data layout; it is a call
 CPU MoE kernel invokes. The branch has since grown a small tail of related follow-on commits
 (async host-device copy for the gather, batched readahead, the MTP draft borrow, the qwen4exp
 nextn / NVMe prefetch work, the multi-token MoE fusion port for speculative decoding, the MTP
-compact-rollback / adaptive-draft port, and the Qwen3.8-Flash-Next QSA gather port that bounds
-decode attention to the indexer-selected cells) - the
+compact-rollback / adaptive-draft port, the Qwen3.8-Flash-Next QSA gather port that bounds
+decode attention to the indexer-selected cells, and the batched grid-IQ panel GEMM that
+vectorizes CPU prefill for importance-matrix quantized models) - the
 *seam* itself is still exactly that one hook; everything else on the branch is llama.cpp-side
 performance work that the public API absorbs without touching `core/`.
 
@@ -200,13 +201,14 @@ If a future release moves the two hooks (a stable expert-residency API, say) ups
 this seam shrinks further or disappears — `core/` does not change.
 
 Pinned submodule at the time of writing: `OllyJohnston/llama.cpp` branch
-`bmoe/expert-ready-hook`, commit `f3ad45b9a` - the expert-ready hook (section 3) plus the
+`bmoe/expert-ready-hook`, commit `d5e576b6` - the expert-ready hook (section 3) plus the
 follow-on work described above, on top of upstream `ggml-org/llama.cpp` master (base
 `b10680`, carrying the merged Qwen3.8-Flash-Next support), extended with the multi-token MoE
 fusion port (PR #27621 minus SWIGLU_CLAMP; see CHANGELOG 0.24.0), the MTP compact-rollback /
-adaptive-draft port (`--spec-mtp-cr-depth`, `--spec-draft-adaptive`; see `docs/mtp.md`), and
-the Qwen3.8-Flash-Next QSA gather port (PR #27977; see CHANGELOG 0.25.0) that cuts decode
-attention from a full cache-window mask to the indexer-selected cells. The
+adaptive-draft port (`--spec-mtp-cr-depth`, `--spec-draft-adaptive`; see `docs/mtp.md`), the
+Qwen3.8-Flash-Next QSA gather port (PR #27977; see CHANGELOG 0.25.0) that cuts decode
+attention from a full cache-window mask to the indexer-selected cells, and the batched grid-IQ
+panel GEMM (PR #27402; see CHANGELOG 0.26.0) that vectorizes CPU prefill for IQ models. The
 branch is pushed to the public `OllyJohnston/llama.cpp` fork, so the pin is reachable for any
 clone of this repo. Each bump gets its own fork branch and the previous ones stay, so every
 commit an old pin names remains reachable (see `.gitmodules` / `git submodule status` for the
