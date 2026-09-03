@@ -539,16 +539,116 @@ void ExpertStreamSource::prefetch(int il, const int32_t * ids, int n_ids) {
     io_cv_.notify_all();
 }
 
+// Active prediction queue: the prediction worker publishes the ids it ranked for a layer ahead.
+// The lanes consume these as a speculation source on idle — committing pages on a miss and reading
+// the slices, exactly as the eval-issued prefetch does. The worker only ever pushes ids; all page
+// commit and LRU mutation stays on the eval thread (quiesce_spec integrates completed entries).
+void ExpertStreamSource::enable_active_prefetch() {
+    // Only meaningful with an LRU cache (the lanes commit into lbuf_); the shared-slot mode
+    // (cache_max_ == 0) has no per-entry residency to speculate into.
+    pred_ids_enabled_ = (cache_max_ != 0);
+}
+
+void ExpertStreamSource::enqueue_predicted_ids(int il, const int32_t * ids, int n_ids) {
+    if (!active_ || cache_max_ == 0 || il < 0 || il >= n_layer_ || !ids || n_ids <= 0) return;
+    if (!pred_ids_enabled_ || !layers_[il].bound) return;
+    std::lock_guard<std::mutex> lk(io_mtx_);
+    // Bounded: drop the oldest if the queue is full (a burst of predictions must not overwhelm
+    // the lanes, and the newest prediction is the most likely to be relevant).
+    for (int i = 0; i < n_ids; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= n_expert_) continue;
+        const int32_t id = il * n_expert_ + e;
+        if (cvalid_[id] || spec_remaining_[id] != 0) continue; // already resident or queued
+        if (pred_ids_.size() >= pred_ids_cap_) pred_ids_.erase(pred_ids_.begin());
+        pred_ids_.emplace_back(id, il);
+    }
+}
+
 // Drain queued speculative reads on an idle lane. Bails as soon as a real batch this worker has
 // not served appears, so speculation never delays real work. A completed entry (all projections
 // read under the current spec generation) is handed to the eval thread via spec_done_.
 void ExpertStreamSource::drain_spec(int lane, uint64_t worker_seen) {
     for (;;) {
+        // Active prediction queue first: an idle lane consumes a predicted-id speculation entry,
+        // committing pages on a miss and reading the slices. This runs BEFORE the eval-issued
+        // spec_jobs_ so a lane that can do work picks the freshest predicted read first — the
+        // whole point of the lane-direct prefetch is to start reads a full layer earlier. The
+        // predicted entry's jobs are read HERE, in this lane, one at a time; they never touch
+        // spec_jobs_/spec_next_ (whose ordering belongs to the eval-issued queue alone).
+        bool staged_pred = false;
+        IoJob pj;
+        uint64_t pg = 0;
+        {
+            std::lock_guard<std::mutex> lk(io_mtx_);
+            if (io_stop_ || batch_gen_ > worker_seen) return; // shutting down, or real work waiting
+            while (pred_ids_next_ < pred_ids_.size() && !staged_pred) {
+                const auto [id, pil] = pred_ids_[pred_ids_next_++];
+                if (cvalid_[id] || spec_remaining_[id] != 0) continue; // superseded; skip
+                const int e = id % n_expert_;
+                // Commit pages + build jobs (same staging as prefetch()). This is the LANE's own
+                // scratch (spec_pred_stage_), NOT spec_stage_ — the eval thread's prefetch() uses
+                // that one without the lock (lines 453-508), so sharing it here would race it.
+                std::vector<IoJob> & staged = spec_pred_stage_;
+                staged.clear();
+                bool ok = true;
+                for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                    const uint64_t slice = layers_[pil].proj[p].nb2;
+                    if (slice == 0) continue;
+                    char * dst = (char *) lbuf_[p][pil] + (uint64_t) e * slice;
+                    uintptr_t a0 = (uintptr_t) dst & ~(uintptr_t) (page_ - 1);
+                    uintptr_t a1 = ((uintptr_t) dst + slice + page_ - 1) & ~(uintptr_t) (page_ - 1);
+                    if (!pio::vm_commit((void *) a0, (size_t) (a1 - a0))) { ok = false; break; }
+                    staged.push_back({dst, layers_[pil].proj[p].file_off + (uint64_t) e * slice, slice, id,
+                                      (int16_t) layers_[pil].proj[p].file_idx, e, (int16_t) pil, (int8_t) p, 1});
+                }
+                if (!ok || staged.empty()) continue;
+                spec_remaining_[id] = (int32_t) staged.size();
+                spec_touched_.push_back(id);
+                // Insert all BUT the first slice into spec_jobs_: this lane reads the first slice
+                // immediately (pj below), so appending it too would double-read it when the
+                // standard drain's spec_next_ reaches the tail. The remaining slices are read by
+                // whichever lane gets there after the eval-issued jobs are exhausted.
+                if (staged.size() > 1)
+                    spec_jobs_.insert(spec_jobs_.end(), staged.begin() + 1, staged.end());
+                // Read exactly this entry's jobs, right now (this lane), before anything else.
+                // CRITICAL: count the first slice against spec_inflight_ exactly like the standard
+                // drain does — quiesce_spec() waits on spec_inflight_ == 0 before it releases
+                // pages, so a predicted read that skipped the counter could have its pages
+                // released mid-read by the eval thread (measured: WRITE fault on the slice).
+                pg = spec_gen_;
+                pj = staged.front();
+                ++spec_inflight_;
+                staged_pred = true;
+            }
+        }
+        if (staged_pred) {
+            // This lane reads the first slice of the freshly-staged predicted entry. The rest of
+            // its slices remain in spec_jobs_ (at the tail, after the eval-issued jobs) for the
+            // idle lanes to pick up — spec_remaining_/spec_done_ handle the multi-projection
+            // accounting exactly as they do for eval-issued speculation.
+            const uint64_t g2 = pg;
+            const bool ok = read_slice(lane, pj);
+            std::lock_guard<std::mutex> lk(io_mtx_);
+            if (ok && g2 == spec_gen_) {
+                spec_read_bytes_.fetch_add((long long) pj.nbytes);
+                if (spec_remaining_[pj.flag] > 0 && --spec_remaining_[pj.flag] == 0) {
+                    spec_done_.push_back(pj.flag);
+                    spec_done_pending_.fetch_add(1, std::memory_order_relaxed);
+                    io_cv_done_.notify_all();
+                }
+            } else if (!ok && spec_adopt_) {
+                spec_remaining_[pj.flag] = 0;
+                io_cv_done_.notify_all();
+            }
+            if (--spec_inflight_ == 0) io_cv_done_.notify_all();
+            continue; // loop: more predicted ids may be waiting
+        }
         IoJob j;
         uint64_t g;
         {
             std::lock_guard<std::mutex> lk(io_mtx_);
-            if (io_stop_ || batch_gen_ > worker_seen) return; // shutting down, or real work waiting
+            if (io_stop_ || batch_gen_ > worker_seen) return;
             if (spec_next_ >= spec_jobs_.size()) return;
             g = spec_gen_;
             j = spec_jobs_[spec_next_++];

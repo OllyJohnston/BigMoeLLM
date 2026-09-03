@@ -168,6 +168,23 @@ spent there buys back quality at the same threshold, not speed.
 Cost: one gate GEMV per MoE layer per decoded token on the eval thread (the control GEMV is
 probe-only and skipped here), plus one isolated node per layer.
 
+### Active (lane-direct) prefetch
+
+The issue described above runs on the eval thread: the worker finishes its GEMV, and the actual
+read starts only when the next graph callback (`predict_after_load`) hands the ids to the source.
+That round-trip eats part of the head-start a two-layer horizon is supposed to buy. Since 0.27.0
+the worker also publishes the predicted misses into a bounded queue that the **idle I/O lanes
+drain directly**: an idle lane commits the pages and reads the slices itself, exactly as it does
+for eval-issued speculation, so the read can begin a full layer earlier. All LRU mutation stays
+on the eval thread — the lanes only commit pages and read bytes, never touch the LRU order or the
+budget. The two issue paths (worker → queue → lane, and eval → prefetch) dedup through the shared
+`cvalid_`/`spec_remaining_` guards under `io_mtx_`, and the entry-level accounting
+(`spec_inflight_`, `spec_done_`, quiesce integration) is shared unchanged, so a prediction that
+both paths see is read once. Route-ahead (`--route-ahead`) keeps its own issue path and is
+untouched by this. Byte-identity is the same contract (gate G10a still passes: speculation only
+warms the cache), and the lane-direct path engages only when the LRU cache is on (it has nothing
+to speculate into in the shared-slot cache-off mode).
+
 ## The honest caveat about what a good number would mean
 
 A high stale-gate accuracy would say the routing is *knowable* earlier. It would not say that

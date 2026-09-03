@@ -43,6 +43,25 @@ public:
     // retain.
     virtual void retain(int /*il*/, const int32_t * /*ids*/, int /*n_ids*/) {}
 
+    // Active prediction queue (lane-direct prefetch): the prediction worker publishes the ids it
+    // ranked for a future layer here, and the implementation's idle I/O lanes consume them as a
+    // speculation source — committing pages on a miss and reading the slices, exactly as an
+    // eval-issued prefetch would, but starting a full layer earlier because the read issue does not
+    // wait for the eval thread. The caller (a background predictor thread) only ever pushes ids;
+    // all LRU mutation stays on the eval thread. Purely advisory like prefetch(): a correct guess
+    // makes the later load_layer(il, ...) a hit. Default: no-op.
+    virtual void enqueue_predicted_ids(int /*il*/, const int32_t * /*ids*/, int /*n_ids*/) {}
+
+    // Whether this source implements the active (lane-direct) prediction queue. When true, the
+    // prediction worker publishes ids directly to the source instead of the eval-thread round-trip
+    // (predict_after_load -> prefetch). Default: false.
+    virtual bool supports_active_prefetch() const { return false; }
+
+    // Arm the active (lane-direct) prediction queue for this source. Called when the hook enables
+    // speculation; a no-op for sources without the queue (or without an LRU cache to speculate
+    // into). Default: no-op.
+    virtual void enable_active_prefetch() {}
+
     // ── route-trace support (diagnostics only; see bmoe/route_trace.h) ──────────────────
     // These let a tracer describe what a routing COST without changing what it does. All three
     // are eval-thread only, and meaningful only between the routing node and load_layer().

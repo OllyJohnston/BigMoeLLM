@@ -86,6 +86,19 @@ public:
     uint64_t expert_bytes(int il) const override;
     Stats stats() const override;
 
+    // Active prediction queue (option-2 lane-direct prefetch): the prediction worker publishes the
+    // ids it ranks (for layers ahead) here; idle io lanes consume the queue as a speculation source.
+    // The worker only ever pushes ids — all page commit and LRU mutation stays on the eval thread.
+    // Thread-safe (guarded by io_mtx_); bounded; entries age out via the normal quiesce_spec
+    // cancellation. Only meaningful when the source's LRU cache is on (cache_max_ != 0).
+    void enqueue_predicted_ids(int il, const int32_t * ids, int n_ids) override;
+    bool supports_active_prefetch() const override { return true; }
+
+    // Arm the active (lane-direct) prediction queue: idle io lanes will consume predicted ids
+    // published by the prediction worker. Call once when lane-direct prefetch is enabled, before
+    // any decode. No-op if the LRU cache is off (cache_max_ == 0).
+    void enable_active_prefetch();
+
     // Register the process-global expert-ready hook so the CPU matmul blocks per expert
     // until its slice is resident. Only meaningful in overlap mode; a no-op if the fork
     // hook was not compiled in. Paired with shutdown(), which unregisters it.
@@ -307,6 +320,19 @@ private:
     std::vector<int32_t> spec_done_;      // entry ids whose every projection read completed
     std::vector<int32_t> spec_touched_;   // entry ids queued this round (for cleanup at quiesce)
     std::vector<int32_t> spec_remaining_; // per entry id: projection reads still pending (0 = none)
+
+    // ── active prediction queue (option-2 lane-direct prefetch) ──
+    // The prediction worker publishes the ids it ranks (for layers ahead) into this bounded queue;
+    // idle io lanes consume it as a speculation source — committing pages on a miss and reading the
+    // slices into the same spec_jobs_/spec_done_ machinery. The worker only ever pushes ids (pure
+    // compute + one bounded push), and all LRU mutation (commit, evict, integrate) stays on the eval
+    // thread; the lanes just read bytes, exactly as they do for the eval-issued speculation. The
+    // queue is bounded (cap_pred_ids_) to keep a burst of predictions from overwhelming the lanes;
+    // entries age out via quiesce_spec (spec_gen_ bump cancels them like any other round).
+    std::vector<std::pair<int32_t, int32_t>> pred_ids_; // {entry id, layer}; FIFO, bounded
+    size_t pred_ids_next_ = 0;
+    static constexpr size_t pred_ids_cap_ = 64;
+    bool pred_ids_enabled_ = false;
     // Scratch for prefetch(): an expert's jobs are built here and published only once all of its
     // projections have been committed, so a commit that fails part-way can never leave jobs queued
     // against accounting that was never set up. Members rather than locals so the path stays
@@ -314,6 +340,10 @@ private:
     std::vector<IoJob> spec_stage_;
     std::vector<int32_t> spec_stage_ids_;
     std::vector<int> spec_stage_counts_;
+    // Lane-drain scratch for the active (predicted-id) queue. Deliberately SEPARATE from
+    // spec_stage_ (the eval thread's prefetch() scratch, which it uses without the lock): the
+    // lanes populate this one under io_mtx_, and sharing the other would race the eval thread.
+    std::vector<IoJob> spec_pred_stage_;
     std::atomic<long long> spec_read_bytes_{0};
     std::atomic<long long> spec_experts_{0};
     std::atomic<long long> spec_useful_{0};

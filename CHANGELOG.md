@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.27.0] - 2026-09-03
+
+### Added
+- **Active (lane-direct) prediction prefetch.** `--predict-prefetch` previously issued the
+  stale-gate predictor's speculative reads on the eval thread (predict_after_load → prefetch),
+  so the read start waited on the next graph callback. The prediction worker now also publishes
+  the predicted miss ids into a bounded queue the idle I/O lanes drain directly — an idle lane
+  commits the pages and reads the slices itself, starting the read up to a full layer earlier
+  than the eval-thread round-trip allowed. All LRU mutation stays on the eval thread (the lanes
+  only commit pages and read bytes, exactly as the eval-issued speculation already did); the two
+  paths dedup through the shared `cvalid_`/`spec_remaining_` guards under `io_mtx_`, and the
+  entry-level accounting (`spec_inflight_`, `spec_done_`, quiesce integration) is shared
+  unchanged. Route-ahead (`--route-ahead`) is untouched. Byte-identity gates (G10a, G5c, S2)
+  all pass; the full suite is 16/16. See `docs/expert-prediction.md`.
+
+### Changed
+- **Engine version 0.27.0.** `project(VERSION)` in `CMakeLists.txt` bumped from 0.26.1, keeping
+  the engine-reported version in step with the changelog.
+
 ## [0.26.1] - 2026-09-03
 
 ### Fixed

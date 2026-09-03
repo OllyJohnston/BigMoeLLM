@@ -72,7 +72,13 @@ public:
     // against the gguf tensor set, which those do not belong to. Only .tensor is meaningful here.
     const std::unordered_map<std::string, ggml_tensor *> & captured_weights() const { return captured_weights_; }
 
-    void set_source(IExpertSource * src) { source_ = src; } // non-null → stream mode
+    void set_source(IExpertSource * src) {
+        source_ = src; // non-null → stream mode
+        // Lane-direct (active) prefetch can only be armed once the source exists; re-arm here in
+        // case set_predict_prefetch ran before set_source (it does in Session::open).
+        if (source_ && predict_prefetch_ && pred_spec_max_ > 0 && source_->supports_active_prefetch())
+            source_->enable_active_prefetch();
+    } // non-null → stream mode
 
     // Temporal prefetch depth K: while streaming layer l, hint the source to read ahead the
     // experts the previous token used at layers l+1..l+K. 0 (default) disables it.

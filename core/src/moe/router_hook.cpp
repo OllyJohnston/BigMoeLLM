@@ -290,6 +290,10 @@ void RouterHook::set_predict_prefetch(bool on, int spec_max) {
     pred_spec_max_ = spec_max >= 0 ? spec_max : 0;
     predict_prefetch_ = on;
     predict_reset();
+    // Lane-direct (active) prefetch: with speculation on and a source that implements the queue,
+    // the worker publishes ids straight to the io lanes instead of the eval-thread round-trip.
+    if (on && source_ && source_->supports_active_prefetch() && pred_spec_max_ > 0)
+        source_->enable_active_prefetch();
     if (on && !pred_worker_.joinable()) pred_worker_ = std::thread([this] { predict_worker_main(); });
     if (!on) predict_worker_stop();
 }
@@ -430,6 +434,13 @@ void RouterHook::predict_worker_main() {
             build_spec_lists(scores, job.nu, job.drop_frac, job.spec_max, job.resident, r.spec, r.keep);
         }
         r.ready = true;
+        // Active (lane-direct) prefetch: when the source implements the queue, publish the
+        // predicted misses directly to it so an idle I/O lane can start reading them a full layer
+        // earlier than the eval-thread round-trip (predict_after_load -> prefetch) would. This
+        // runs on the worker thread; the source's enqueue is thread-safe (bounded, io_mtx_).
+        if (!job.commit && source_ && source_->supports_active_prefetch() && !r.spec.empty() && job.nl >= 0) {
+            source_->enqueue_predicted_ids(job.nl, r.spec.data(), (int) r.spec.size());
+        }
         std::lock_guard<std::mutex> lk(pred_mtx_);
         pred_result_ = std::move(r);
     }
