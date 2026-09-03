@@ -36,6 +36,10 @@ Semantic Versioning.
   `moe_gates_qwen3moe`, `moe_gates_gemma4` and `moe_gates_split` all pass on every gate
   (G1-G14, S1-S3) — the first fully green suite in the project's history.
 
+### Changed
+- **Engine version 0.26.1.** `project(VERSION)` in `CMakeLists.txt` bumped from 0.26.0, keeping
+  the engine-reported version in step with the changelog.
+
 ## [0.26.0] - 2026-09-01
 
 ### Added
