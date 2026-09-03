@@ -183,3 +183,25 @@ reason not to discard it. That is a cache-policy change, not a prefetch, and off
 the whole class of online cache policies at roughly 5 percentage points over LRU. So even a
 predictor that scores well should be expected to buy little — which is exactly why it gets measured
 here first, at the cost of one flag, rather than built.
+
+## External corroboration: routing locality is real, aggregate usage is not
+
+An audit of upstream `ggml-org/llama.cpp` PR #27861 (draft, 2026-09-03 — a GPU-resident LRU cache
+for host-offloaded MoE expert weights, evaluated and **not ported**, see `docs/seam.md`) produced the
+best public confirmation yet of this document's central numbers, measured on a *different* model:
+
+- On Qwen3.8-Flash-Next (512 experts, 10 routed/token, 28 host-pinned expert layers), a **top-32
+  static "hot expert" list learned on half a workload covers only ~10% of the other half** — uniform
+  would be 6.2%. Static expert pinning is a dead end, exactly as this engine's layer-LFU and sidecar
+  experiments concluded.
+- **Routing temporal locality is strong**: a per-layer LRU-64 would hit ~67%, LRU-128 ~81%, over a
+  54k-record mixed workload (code/math/prose/multilingual). This is what the PR exploits and it
+  corroborates our ARC cache (`68a4678`) being keyed on recency rather than frequency: the exploitable
+  structure in real MoE routing is "the expert used a moment ago is likely to be used again", not
+  "a small set of experts dominates".
+
+Tuning implication for `--cache-mb` sizing and the ARC layers: the locality signal saturates around
+LRU-128 per layer (81% vs 67% for LRU-64 — the marginal gain of the second 64 slots is real but
+shrinking). On models with many more experts per layer (Qwen3.8-Flash-Next's 512), per-layer recency
+caches should be sized toward ~128 slots before the hit-rate curve flattens; the aggregate
+distribution stays near-uniform, so frequency-based promotion buys almost nothing on top.

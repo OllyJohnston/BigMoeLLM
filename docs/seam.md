@@ -171,6 +171,40 @@ returns. This is how `ggml_backend_sched` implements the eval-callback today
   loudly if the ordering ever changes;
 - CI runs the gates on every submodule bump.
 
+## Why single-backend skip tables are a seam hazard (PR #27861 audit)
+
+Upstream draft PR #27861 ("GPU-resident LRU cache for host-offloaded MoE expert weights") was
+evaluated against this fork and **not ported** (2026-09-03; see `docs/expert-prediction.md` for the
+empirical locality data it contributed). Its mechanism is instructive as an anti-pattern for this
+seam:
+
+The PR splits each MoE layer's decode into two `mul_mat_id` chains — a device-resident cache chain
+over a slot table, and the original chain — and makes the split *exact* by having the **CPU-only**
+`mul_mat_id` skip cached experts: it reads a `src[3]`-carried host table and zeroes the dst rows of
+cached ids, while the cache chain serves those ids and maps uncached ones to an all-zero dummy slot.
+
+Two structural problems make that unsafe here:
+
+1. **A single-backend skip is silent double-counting under op offload.** The skip lives only in
+   `ggml-cpu.c`. This engine forces the expert matmul onto CUDA whenever not `--cpu-moe`
+   (`session.cpp: op_offload = !cfg.moe.cpu_moe`, plus the dummy-buft `supports_buft` swap), so the
+   original chain would run on CUDA *ignoring* the skip, compute the cached experts anyway, and the
+   two chains would sum the same experts twice. Output would be wrong with no error raised. The
+   exactness of the split depends on every backend honouring the same skip table.
+2. **It reintroduces the padding-overrun fault class on a new thread.** The PR uploads expert
+   slices from `tensor->data` on a worker thread via `ggml_backend_tensor_set`. In this engine
+   `tensor->data` for expert tensors points at lazily-committed `vm_reserve` ranges; an upload of an
+   expert the streamer has not committed would read reserved-but-uncommitted pages — the same fault
+   the `commit_proj_pages` next-page fix (0.26.1) closes on the scheduler path, reopened on a
+   different thread with no commit coordination.
+
+Design constraint recorded for any future port of this class of feature: **any split/remap
+mechanism that changes which experts a `mul_mat_id` chain computes must be implemented per-backend
+(skip in every backend that can run the node) or gated to a single backend mode (`--cpu-moe`), and
+any reader of rebound expert `tensor->data` must coordinate with the streamer's commit state.** A
+per-process singleton keyed by `up_exps` pointer (the PR's ownership model) is also incompatible
+with this engine's multi-session harness and multi-model server.
+
 ## Upgrading llama.cpp
 
 Because the submodule pins the `bmoe/expert-ready-hook` fork branch (section 3), a bump
