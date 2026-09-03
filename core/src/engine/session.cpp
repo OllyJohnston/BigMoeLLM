@@ -504,6 +504,13 @@ struct Session::Impl {
     std::atomic<bool> cancel_requested{false};
 
     ~Impl() {
+        // Drain any CUDA work the last decode left in flight before freeing the handles that
+        // back it. llama_backend_free() releases the device, and a queued kernel still referencing
+        // a freed buffer faults in the driver; the multi-session gate harness hits exactly that on
+        // its ~19th in-process open. Sync is a no-op on CPU-only runs.
+#if defined(BMOE_HAVE_CUDA)
+        cudaDeviceSynchronize();
+#endif
         // Deterministic teardown order: stop the I/O pool (it holds fds into the mmap and its
         // buffers back the rebound expert tensors), then the context (its eval callback points
         // at the hook), then the hook, then unmap the model, then release the backend.
@@ -987,6 +994,12 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
 #endif
         }
 
+        // The warm-up decode above ran CUDA work; drain it before the clear so the buffer reuse
+        // that follows (and the source's fresh slot bindings) never races a kernel still in flight
+        // against the same device memory. No-op on CPU-only runs.
+#if defined(BMOE_HAVE_CUDA)
+        cudaDeviceSynchronize();
+#endif
         llama_memory_clear(llama_get_memory(ctx), true); // discard warm-up KV
         if (im.ctx_dft) llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
     }

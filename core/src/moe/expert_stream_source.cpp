@@ -946,6 +946,21 @@ bool ExpertStreamSource::commit_proj_pages(int il, int e, int p) {
         std::fprintf(stderr, "bmoe: commit failed\n");
         return false;
     }
+    // The scheduler's MoE used-expert copy pads each consecutive group up to 512 B into the
+    // NEXT expert's slice (ggml-backend.cpp copy_experts: "no NaNs in the padding of the last
+    // expert"). Our buffers are lazily committed, so that read must land in a committed page
+    // or the H2D copy faults on a reserved-but-uncommitted page. One page covers any padding
+    // <= 512 B; the extra page per committed expert per projection is negligible, and
+    // VirtualAlloc(MEM_COMMIT) is a no-op on pages already committed. The next expert's entry
+    // is NOT marked resident by this — residency accounting is untouched, only the page is
+    // made valid so a padded read cannot fault.
+    if ((int) e + 1 < n_expert_) {
+        const uintptr_t b0 = ((uintptr_t) dst + slice) & ~(uintptr_t) (page_ - 1);
+        if (!pio::vm_commit((void *) b0, page_)) {
+            std::fprintf(stderr, "bmoe: commit (next-expert padding) failed\n");
+            return false;
+        }
+    }
     return true;
 }
 

@@ -19,7 +19,7 @@ namespace bmoe {
 // builds the standard chain top_k -> top_p -> temp -> dist. Opt-in by construction: sampling never
 // perturbs a run that did not ask for it, so the gates stay meaningful.
 struct SamplingConfig {
-    float temp = 0.7f;           // <= 0: greedy (argmax). > 0: stochastic sampling. Default 0.7
+    float temp = 0.0f;           // <= 0: greedy (argmax). > 0: stochastic sampling. Default greedy
     int top_k = 40;              // 0 disables the top-k stage (llama.cpp convention). Default 40
     float top_p = 0.95f;         // nucleus cutoff, in (0, 1]. Default 0.95
     float min_p = 0.05f;         // min-p cutoff. Default 0.05

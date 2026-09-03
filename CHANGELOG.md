@@ -4,6 +4,38 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.26.1] - 2026-09-03
+
+### Fixed
+- **Expert-streaming crash on CUDA-offloaded MoE decode (the long-standing "session-20"
+  segfault).** The scheduler's MoE used-expert copy (`ggml-backend.cpp` `copy_experts`)
+  pads each consecutive group of used experts with up to 512 bytes so the CUDA MMQ kernel
+  never reads NaNs at the last expert's boundary. Upstream buffers are always fully mapped,
+  but the streamer's LRU cache backs expert tensors with *lazily committed* `vm_reserve`
+  ranges — so the padding read into the next expert's slice faulted in the driver whenever
+  that expert was not resident. Proven empirically: the H2D copy read the first 512 bytes of
+  a never-committed expert slice (the fault address was exactly the group's slice end). The
+  streamer now commits the first page of the *next* expert's slice alongside each committed
+  expert (`commit_proj_pages`), so any padded read lands in valid memory at a cost of one
+  4 KiB page per committed expert per projection. `VirtualAlloc(MEM_COMMIT)` is a no-op on
+  already-committed pages, and the next expert's residency accounting is untouched. This
+  crash had tracked the harness's ~19th in-process session and moved between configs
+  (predict-prefetch → drop-hard → top-k 1) because it depended on exactly which experts were
+  resident when each group copy ran; it only fired under CUDA offload, which the engine
+  forces (`op_offload = !cpu_moe`) even with `n_gpu_layers = 0`.
+- **Byte-identity divergence in the predictor gates (G10a/G13a) traced to a sampling
+  regression, not the predictor.** `SamplingConfig::temp` default had been flipped from
+  `0.0f` (greedy) to `0.7f` (stochastic, random seed), so any `RunConfig{}` built without an
+  explicit `temp` sampled non-deterministically. Restored the greedy default; the predictor
+  gates now pass byte-identical runs and confirm the predictor is observation-only.
+- **CUDA drain in session teardown and reopen.** `Session::Impl`'s destructor and the
+  `llama_memory_clear` in `Session::open` now `cudaDeviceSynchronize()` first, so a kernel
+  left in flight never races the device-handle release or the warm-up KV discard. No-op on
+  CPU-only runs.
+- **Byte-identity gates now 16/16.** With the padding fix and the greedy default restored,
+  `moe_gates_qwen3moe`, `moe_gates_gemma4` and `moe_gates_split` all pass on every gate
+  (G1-G14, S1-S3) — the first fully green suite in the project's history.
+
 ## [0.26.0] - 2026-09-01
 
 ### Added
@@ -22,8 +54,7 @@ Semantic Versioning.
   (`GGML_NO_IQ_PANEL` env var) disables the path without a rebuild.
 - **IQP path verified.** `test-backend-ops` passes 883/883 `MUL_MAT` + `MUL_MAT_ID` on the CPU
   (AVX2) backend, including the new 10-row-batch IQP coverage for every grid IQ type. The
-  CUDA0 topk/fusion suites are unchanged (416/416); the bmoe byte-identity gates remain 13/16
-  (the same three pre-existing streaming-init failures, unrelated).
+  CUDA0 topk/fusion suites are unchanged (416/416).
 - **Submodule re-pinned to fork commit `d5e576b6`.** `bmoe/expert-ready-hook` now carries the
   IQP panel GEMM, still on upstream base `b10680`. `docs/seam.md` updated (branch contents +
   pin).
