@@ -676,6 +676,7 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
             if (!new_content.empty()) {
                 if (!first) data += ",";
                 data += "\"content\":\"" + json_escape(new_content) + "\"";
+                first = false;
             }
             if (first) data += "\"content\":\"\"";
             data += "},\"finish_reason\":null";

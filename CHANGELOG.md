@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.27.3] - 2026-09-05
+
+### Fixed
+- **Malformed chat delta when content follows reasoning (AnythingLLM "position 142" parse error).**
+  The streamed-chunk builder tracked `first` (has a delta field been emitted?) but only set it to
+  false on a *reasoning* delta. The first content-only delta (when the model finishes thinking and
+  starts its answer) therefore emitted `"content":"<token>""content":""` — a duplicate `content`
+  key glued to the real value with no separator. Almost every JSON parser rejects that, and
+  AnythingLLM's relay failed on it with `Expected ',' or '}' after property value in JSON at
+  position 142`, surfaced as "Could not respond to message." The bug only fired once a run *left*
+  reasoning, which is why smaller `max_tokens` runs (all reasoning, no content) appeared healthy.
+  The content branch now clears `first`, so a content-only delta is exactly `{"content":"..."}`.
+- **M-RoPE `X < Y` violation via a stale MTP draft context after a refused target trim.**
+  At end of turn, the speculative KV trim first removes the target's tail; if the target's
+  `seq_rm` is refused (hybrid memory can refuse a large rollback), the code full-cleared the
+  target and emptied `kv_tokens`. The MTP draft context then ran its *own* `seq_rm`, which could
+  *succeed* via a snapshot rollback -- leaving the draft still holding positions `[0, emitted_end)`.
+  The next request saw `kv_tokens` empty (rewind skipped), prefilled at position 0, and the draft
+  context's first decode tripped the strict-monotonicity M-RoPE check (`llama_decode` = -1; fatal:
+  "MTP draft context failed..."). The end-of-turn trim and the cancel-rollback path now force a
+  full draft clear whenever the target went to a full re-prefill, so the target and draft can
+  never drift apart.
+
+### Changed
+- **Engine version 0.27.3.** `project(VERSION)` bumped from 0.27.2.
+
 ## [0.27.2] - 2026-09-04
 
 ### Fixed

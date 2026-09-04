@@ -1353,22 +1353,29 @@ RunResult Session::generate(const GenerateRequest & req,
     // Roll this turn back to the state before it started: drop the KV added this turn, forget the
     // tokens we fed, and un-append the user message. Used on cancel so prior turns stay usable.
     auto rollback_turn = [&]() {
+        bool target_cleared = false;
         if (chat_on) {
-            if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) n_common, -1))
+            if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) n_common, -1)) {
                 llama_memory_clear(llama_get_memory(ctx), true);
-            im.kv_tokens.resize(n_common);
+                target_cleared = true;
+            }
+            if (target_cleared)
+                im.kv_tokens.clear(); // the prefix is gone too; a stale n_common must not survive
+            else
+                im.kv_tokens.resize(n_common);
             if (history_pushed) {
                 im.chat_history.pop_back();
                 history_pushed = false;
             }
         } else {
             llama_memory_clear(llama_get_memory(ctx), true);
+            target_cleared = true;
         }
         // Whatever the target rolled back to, the draft context follows: a cancelled turn that left
         // the two at different positions would fail the NEXT turn, not this one.
         if (im.ctx_dft) {
-            const llama_pos keep = chat_on ? (llama_pos) n_common : 0;
-            if (!llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), 0, keep, -1))
+            if (target_cleared ||
+                !llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), 0, (llama_pos) n_common, -1))
                 llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
         }
     };
@@ -1808,17 +1815,24 @@ RunResult Session::generate(const GenerateRequest & req,
     // produced this answer, so trim back to what was actually emitted.
     if (spec_on) {
         const llama_pos emitted_end = (llama_pos) n_prompt + n_gen;
+        bool target_cleared = false;
         if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, emitted_end, -1)) {
             // Nothing survives that we can still describe, so say so rather than leave kv_tokens
             // asserting a prefix the context no longer holds. The next turn re-prefills in full.
             llama_memory_clear(llama_get_memory(ctx), true);
             im.kv_tokens.clear();
+            target_cleared = true;
         }
         // The draft context mirrors the target's positions (process() decodes the same batches into
         // it), so it is trimmed to the same point — not cleared, or a continued chat turn would
         // feed it only the new suffix and draft from a state that never saw the conversation.
-        if (mtp_on && !llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), 0, emitted_end, -1))
-            llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
+        // But if the target went to a FULL re-prefill, the draft must be emptied too: the next
+        // turn starts at position 0, and a draft still holding [0, emitted_end) trips the
+        // M-RoPE X < Y check on its very first decode (llama_decode = -1, whole request fails).
+        if (mtp_on) {
+            if (target_cleared || !llama_memory_seq_rm(llama_get_memory(im.ctx_dft.get()), 0, emitted_end, -1))
+                llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
+        }
     }
 
     ++im.turn; // this turn is written; label the next one apart
