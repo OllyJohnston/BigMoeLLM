@@ -465,7 +465,7 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
     // blocks full of '}' or literal "role"/"content" in the text can no longer corrupt
     // the message boundary scan (tests/openai_parse_test.cpp).
     bmoe::openai::ParsedBody pb;
-    if (!bmoe::openai::parse_body(req.body, state.session_cfg.sampling, pb)) {
+    if (!bmoe::openai::parse_body(req.body, state.session_cfg.sampling, pb, state.session_cfg.n_predict)) {
         send_json_error(fd, 400, pb.error.c_str(), false);
         return;
     }
@@ -895,6 +895,7 @@ int main(int argc, char ** argv) {
 
     RunConfig cfg;
     ServerConfig srv;
+    bool n_predict_set = false; // -n/--n-predict explicitly given: feeds the wire fallback
 
     std::set<std::string> seen;
 
@@ -931,8 +932,10 @@ int main(int argc, char ** argv) {
             srv.api_key = next("--api-key");
         else if (a == "-p" || a == "--prompt") {
             next("-p"); // ignored in server mode
-        } else if (a == "-n" || a == "--n-predict")
+        } else if (a == "-n" || a == "--n-predict") {
             cfg.n_predict = std::atoi(next("-n"));
+            n_predict_set = true;
+        }
         else if (a == "-t" || a == "--threads")
             cfg.n_threads = std::atoi(next("-t"));
         else if (a == "-ngl" || a == "--n-gpu-layers")
@@ -1137,7 +1140,9 @@ int main(int argc, char ** argv) {
     // ── Open the session ──────────────────────────────────────────────
     std::fprintf(stderr, "bmoe-server: loading model %s ...\n", cfg.model_path.c_str());
 
-    const SessionConfig sc = session_config_from(cfg);
+    const SessionConfig sc_base = session_config_from(cfg);
+    SessionConfig sc = sc_base;
+    if (n_predict_set) sc.n_predict = cfg.n_predict; // -n only when explicitly given (RunConfig default 128 is CLI semantics)
     std::string error;
     std::unique_ptr<Session> session = Session::open(sc, error, nullptr, nullptr, nullptr);
     if (!session) {

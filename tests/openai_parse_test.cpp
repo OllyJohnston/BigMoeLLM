@@ -130,6 +130,11 @@ int main() {
         expect(pb.n_predict == 50, "max_tokens wins over max_completion_tokens");
         openai::parse_body(R"({"prompt":"Hi"})", SamplingConfig{}, pb);
         expect(pb.n_predict == 512, "512 fallback when no token cap is given");
+        // Explicit n_predict_default (the server's -n/--n-predict) replaces the fallback.
+        openai::parse_body(R"({"prompt":"Hi"})", SamplingConfig{}, pb, 20000);
+        expect(pb.n_predict == 20000, "n_predict_default applies when no token cap is given");
+        openai::parse_body(R"({"prompt":"Hi","max_tokens":77})", SamplingConfig{}, pb, 20000);
+        expect(pb.n_predict == 77, "max_tokens still wins over n_predict_default");
     }
 
     // ── Sampling override spellings ────────────────────────────────────────────

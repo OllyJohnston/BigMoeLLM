@@ -35,8 +35,11 @@ struct ParsedBody {
 
 // Parse one request body against the session's sampling defaults. Returns false and fills
 // `error` on malformed JSON, a missing messages/prompt, an empty trailing user message, or a
-// trailing message whose role is not "user". Never throws.
-inline bool parse_body(const std::string & body, const SamplingConfig & defaults, ParsedBody & out) {
+// trailing message whose role is not "user". Never throws. `n_predict_default` is the value a
+// request omitting BOTH max_tokens and max_completion_tokens falls back to (the server's
+// -n/--n-predict flag feeds it; 512 preserves the historical wire default).
+inline bool parse_body(const std::string & body, const SamplingConfig & defaults, ParsedBody & out,
+                       int n_predict_default = 512) {
     out.sampling = defaults;
 
     nlohmann::json root;
@@ -113,10 +116,10 @@ inline bool parse_body(const std::string & body, const SamplingConfig & defaults
         }
     }
 
-    // max_tokens first, then max_completion_tokens (the newer OpenAI name); 512 fallback.
+    // max_tokens first, then max_completion_tokens (the newer OpenAI name); session default.
     out.n_predict = root.value("max_tokens", 0);
     if (out.n_predict <= 0) out.n_predict = root.value("max_completion_tokens", 0);
-    if (out.n_predict <= 0) out.n_predict = 512;
+    if (out.n_predict <= 0) out.n_predict = n_predict_default;
 
     out.stream = root.value("stream", false);
 

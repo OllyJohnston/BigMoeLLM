@@ -29,6 +29,13 @@ Semantic Versioning.
 
 ### Changed
 - **Engine version 0.27.3.** `project(VERSION)` bumped from 0.27.2.
+- **Server `-n`/`--n-predict` now sets the session-default token cap.** The flag was parsed but
+  never read: requests that omitted both `max_tokens` and `max_completion_tokens` always fell
+  back to a hardcoded 512 (`openai_body.h`). `parse_body` now takes an `n_predict_default`
+  (the server hands it `SessionConfig::n_predict`, fed by `-n` only when explicitly given; 512
+  stays the default so existing behaviour is untouched). Live check: a server on `-n 20000
+  -c 4000` capped an uncapped request at the context limit (3872 tokens) instead of 512. Unit
+  tests added for the default and for `max_tokens` precedence.
 
 ## [0.27.2] - 2026-09-04
 

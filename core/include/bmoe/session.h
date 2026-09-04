@@ -58,6 +58,10 @@ struct SessionConfig {
     bool compute_trace_layers = false;
     SamplingConfig sampling; // fixed for the session; greedy by default (temp <= 0)
     MoeStreamConfig moe;
+    // Default n_predict for requests that omit max_tokens (the OpenAI-wire fallback; the
+    // server's -n/--n-predict flag feeds this). CLI callers never read it — they set the
+    // per-request value directly.
+    int n_predict = 512;
     // Self-speculative decoding, and which source drafts. Fixed for the session: it decides whether
     // open() builds the wider verify batch, and — for the MTP source only — the draft context.
     // See RunConfig::spec.

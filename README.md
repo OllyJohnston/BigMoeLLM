@@ -132,14 +132,27 @@ Launch `bmoe-server` with your model:
 build/cli/Release/bmoe-server.exe \
   -m "D:\AI_Models\Qwen3.6-35B-A3B-APEX-MTP-I-Quality.gguf" \
   --port 10000 \
-  --n-gpu-layers 99 \
-  --n-pinned-layers 12 \
+  --cpu-moe \
+  --n-pinned-layers 18 \
+  -ngl 99 \
+  -t 8 \
+  --ubatch 512 \
+  --batch-size 512 \
+  -c 32000 \
+  -n 20000 \
   -ctk q8_0 \
   -ctv q8_0 \
   -fa \
-  --cpu-moe \
-  -t 12
+  --mtp \
+  --draft 3 \
+  --temp 0.7 \
+  --top-p 0.95 \
+  --top-k 40 \
+  --min-p 0.05 \
+  --repeat-penalty 1.1
 ```
+
+This is the measured reference profile for Qwen3.6-35B-A3B (MTP) on an RTX 5070 Ti (16 GB) with 64 GB DDR5. `-n 20000` sets the *session default* for `max_tokens` used only when a request omits it — a per-request `max_tokens` always wins and is capped at `max(32, n_ctx - 128)`, so any client request stays inside the 32k context. For a bare (non-MTP) profile use `--n-pinned-layers 12` without `--mtp`/`--draft`.
 
 > **Concurrency**: each connection runs on its own worker thread. Inference is serialized — a second
 > generation request while one is active returns `HTTP 429` (`"Another generation is in progress; try
@@ -166,6 +179,11 @@ build/cli/Release/bmoe-server.exe \
 | `-ctv, --cache-type-v <type>` | KV cache quantization for Value (`q8_0`, `q4_0`, `f16`) | `f16` |
 | `-fa, --flash-attn` | Enable Flash Attention | `true` |
 | `-t, --threads <int>` | CPU worker threads for unpinned computation | `12` |
+| `-n, --n-predict <int>` | Session-default `max_tokens` for requests that omit one (per-request value caps at `max(32, n_ctx-128)`) | `512` |
+| `--mtp` | Self-speculative decoding via the model's trained MTP head | `false` |
+| `--draft <int>` | Draft tokens per verify batch (`1..8`; 3 is the sweet spot for a single head) | `3` |
+| `--spec-mtp-cr-depth <int>` | Recurrent snapshot rollback depth for MTP (`-1` = off, keep `n_rs_seq = draft_max`; see `docs/mtp.md`) | `-1` |
+| `--spec-draft-adaptive` | Size each draft from measured acceptance instead of always drafting `--draft` | `false` |
 | `--temp <float>` | Default sampling temperature (<=0 for greedy) | `0.7` |
 | `--top-p <float>` | Default nucleus sampling cutoff | `0.95` |
 | `--top-k <int>` | Default Top-K cutoff | `40` |
@@ -257,6 +275,7 @@ For custom inference engines and forks, users and downstream tools need clear do
 
 ### Recent Improvements & Milestones
 
+- **2026-09-05: Measured MTP Reference Profile in Server Quickstart**: The `bmoe-server` quickstart now documents the reference profile for Qwen3.6-35B-A3B (MTP) on an RTX 5070 Ti — `--cpu-moe --n-pinned-layers 18 -t 8 -c 32000 -n 20000 --mtp --draft 3` with the full sampling stack — and notes that `-n` sets a session default for requests that omit `max_tokens` (per-request values win and are capped at `max(32, n_ctx-128)`). Added `-n`, `--mtp`, `--draft`, `--spec-mtp-cr-depth` and `--spec-draft-adaptive` to the Server Flags Reference.
 - **2026-09-05: Chat-Delta Serialization & MTP Draft-Context Fix (engine 0.27.3)**: Fixed the AnythingLLM "Could not respond to message" crash (`Expected ',' or '}' after property value in JSON at position 142`). The streamed chat-delta builder only marked a delta entered for *reasoning*, so the first content-only delta (when a thinking model starts its answer) emitted a duplicate `content` key glued to the value with no separator — `"content":"X""content":""`. It is now exactly `{"content":"X"}`. Also fixed an M-RoPE `X < Y` failure where a refused target trim could leave the MTP draft context holding stale positions while the target went to a full re-prefill; the draft is now force-cleared whenever the target is. (The 0.27.2 note below covered the *error* finalization path; this one addresses the real cause in the *success* path.)
 - **2026-09-04: KV-Reset & SSE-Finalization Fix (engine 0.27.2)**: Fixed the M-RoPE `X < Y` violation (`llama_decode` = -1) on consecutive requests after a failed turn. The multi-turn prefix-reuse path only trimmed the target KV on divergence; a request that failed after prefill left stray KV rows the token mirror no longer described, and the retry re-inserted at the same positions (a strict-monotonicity violation in Qwen's M-RoPE). The engine now trims the target KV from `n_common` unconditionally on every continued turn and clears both the target KV and the MTP draft context on any `generate()` failure, so the next request re-prefills from a clean, position-consistent state. Streaming failures now terminate with a valid `finish_reason:"error"` chunk + `error` object + `data: [DONE]` instead of a false `"stop"`, fixing client-side JSON/SSE parse errors (e.g. at character ~142 in AnythingLLM).
 - **2026-09-04: Predict-Prefetch Crash Fix with Hybrid Static Offload (engine 0.27.1)**: Fixed a crash on `--predict-prefetch` + `--n-pinned-layers`: the speculative-read path assumed every layer index exists in the host `lbuf_` ring, but pinned layers have a null host buffer (their weights are GPU-resident). The lane staging loop then shipped read jobs with a null destination — `VirtualAlloc(NULL, MEM_COMMIT)` silently succeeds at a system address, so a lane's `FileReader::read` jumped to 0x0. Proven with cdb (`memcpy_repmovs` WRITE@0x0 ← `drain_spec` ← `io_worker`). Pinned layers are always resident, so speculation is a no-op for them: `prefetch`, `enqueue_predicted_ids` and the staging loop now early-return on `is_layer_pinned`. Crash only reproduced live (gate models use unpinned tiny-moe), so the gates could not catch it; suite still 16/16. Debug tooling (cdb/dumpbin/DbgHelp/readiness-probe) documented in `AGENTS.md`.
