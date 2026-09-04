@@ -728,7 +728,11 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
         send_sse(fd, data);
         send_sse_done(fd);
     } else {
-        // Stream an error then done
+        // A decode/prefill failure after the stream already started: terminate the SSE stream
+        // with a proper error event, NOT a bare JSON body mid-stream and NOT a false "stop". The
+        // OpenAI chunk shape is kept (delta + finish_reason) with an explicit error object so a
+        // strict client can distinguish a completed run from a failed one; finish_reason "error"
+        // is what OpenAI-compatible probes listen for.
         std::string err_data = "{\"id\":\"" + id_prefix + "-" + std::to_string(created) +
                                "\","
                                "\"object\":\"" +
@@ -741,8 +745,11 @@ static void handle_completions(socket_t fd, const HttpRequest & req, ServerState
                                "\"choices\":[{"
                                "\"index\":0,"
                                "\"delta\":{},"
-                               "\"finish_reason\":\"stop\""
-                               "}]}";
+                               "\"finish_reason\":\"error\""
+                               "}],"
+                               "\"error\":{\"message\":\"" +
+                               json_escape(result.error) +
+                               "\",\"type\":\"api_error\"}}";
         send_sse(fd, err_data);
         send_sse_done(fd);
     }

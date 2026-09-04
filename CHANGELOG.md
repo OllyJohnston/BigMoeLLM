@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.27.2] - 2026-09-04
+
+### Fixed
+- **M-RoPE `X < Y` violation (`llama_decode` = -1) on consecutive requests after a failed turn.**
+  The multi-turn prefix-reuse path only trimmed the target KV when the new prompt *diverged* from
+  the token mirror (`n_common < kv_tokens.size()`). A request that failed after prefill (decode
+  error) could leave stray KV rows at `[n_common, ...)` that the mirror no longer described; the
+  retry of the same conversation then detected a full prefix match, skipped the trim, and
+  re-inserted at those *same* positions — a strict-monotonicity violation in the Qwen M-RoPE
+  implementation. The engine now trims the target KV from `n_common` unconditionally on every
+  continued turn (a no-op in the healthy case, a healing trim in the fault case), and `generate()`
+  failures now clear both the target KV and the MTP draft context (`ctx_dft`) so the next request
+  always re-prefills from a clean, position-consistent state.
+- **Streaming error serialization.** A decode/prefill failure mid-stream used to emit a chunk with
+  `finish_reason:"stop"` and no error — indistinguishable from a completed run and a cause of
+  client-side JSON/SSE parse errors (e.g. at character ~142 in AnythingLLM). The stream now
+  terminates with a valid `finish_reason:"error"` chunk carrying an `error` object (message +
+  `type: "api_error"`), followed by `data: [DONE]`. Every SSE event stays `data: {json}\n\n`.
+
+### Changed
+- **Engine version 0.27.2.** `project(VERSION)` bumped from 0.27.1.
+
 ## [0.27.1] - 2026-09-04
 
 ### Fixed

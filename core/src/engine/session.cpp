@@ -1162,6 +1162,16 @@ RunResult Session::generate(const GenerateRequest & req,
     auto fail = [&](std::string msg) {
         res.ok = false;
         res.error = std::move(msg);
+        // Leave the session clean for the NEXT request: a decode/prefill failure can leave stray KV
+        // rows (an M-RoPE "X < Y" violation on the retry) and the draft context at a desynced
+        // position (a "batch position must be strictly increasing" rejection on the retry). Clearing
+        // both here means the next turn re-prefills from scratch — the n_common prefix match will be
+        // empty, which is exactly the state the tokenizer's full-history template needs. The
+        // in-flight token mirror is dropped with it, so a subsequent n_common scan cannot diff
+        // against rows we no longer hold.
+        if (ctx) llama_memory_clear(llama_get_memory(ctx), true);
+        if (im.ctx_dft) llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
+        im.kv_tokens.clear();
         return res;
     };
 
@@ -1317,15 +1327,20 @@ RunResult Session::generate(const GenerateRequest & req,
         const size_t max_common = tokens.size() > 0 ? tokens.size() - 1 : 0;
         while (n_common < im.kv_tokens.size() && n_common < max_common && im.kv_tokens[n_common] == tokens[n_common])
             ++n_common;
-        if (n_common < im.kv_tokens.size()) {
+        // Trim the target KV to the shared prefix. This runs even when n_common reached the END of
+        // kv_tokens (the common case: a continued turn re-sends the same history): a prior turn that
+        // FAILED after prefill (decode error) can leave stray KV rows at [n_common, ...) that the
+        // token mirror no longer describes, and the retry would otherwise re-insert at those SAME
+        // positions — an M-RoPE "position X < Y" violation (llama_decode = -1). Trimming from
+        // n_common unconditionally makes that case a no-op and the healthy case a no-op too (there
+        // is nothing at/above n_common to remove).
+        if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) n_common, -1)) {
             // SWA-style memory (e.g. Gemma) can refuse a partial removal; fall back to a full
             // re-prefill in that case rather than continuing from an inconsistent cache.
-            if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) n_common, -1)) {
-                llama_memory_clear(llama_get_memory(ctx), true);
-                n_common = 0;
-            }
-            im.kv_tokens.resize(n_common);
+            llama_memory_clear(llama_get_memory(ctx), true);
+            n_common = 0;
         }
+        if (n_common < im.kv_tokens.size()) im.kv_tokens.resize(n_common);
         // The draft context mirrors the target's positions, so it has to be rewound to the SAME
         // point — including when n_common did not move, since the previous turn left it holding
         // everything it generated. Miss this and the first prefill batch of the turn starts at a
