@@ -335,8 +335,17 @@ void RouterHook::predict_worker_stop() {
 }
 
 void RouterHook::predict_reset() {
+    // Quiesce barrier: a reset mutates the very structures the prediction worker is walking —
+    // gate_w_, gate_w_host_, h_t_, the stashes. The worker publishes the busy flag before it
+    // starts executing a job and clears it after it finishes; a reset must wait until the worker
+    // is completely idle before it touches any of those members. Holding the mutex across the
+    // whole function (not just the final lines) closes the window where a mid-reset unlock could
+    // let the worker steal a pointer to a vector that is being reinitialised.
+    std::unique_lock<std::mutex> lk(pred_mtx_);
+    pred_cv_idle_.wait(lk, [&] { return !worker_busy_; });
     const int n = n_layer_ > 0 ? n_layer_ : 0;
     gate_w_.assign(n, nullptr);
+    gate_w_host_.assign(n, std::vector<uint8_t>{});
     h_t_.assign(n, nullptr);
     pred_stale_.assign(n, std::vector<int32_t>{});
     pred_stale2_.assign(n, std::vector<int32_t>{});
@@ -348,12 +357,11 @@ void RouterHook::predict_reset() {
     predict_unscored_ = 0;
     wd_slots_ = wd_hits_ = wd_rout_ = 0;
     wd_tripped_ = false;
-    std::lock_guard<std::mutex> lk(pred_mtx_);
     pred_job_pending_ = false;
     pred_result_ = PredictResult{};
 }
 
-static bool gate_scores(const ggml_tensor * w, const std::vector<float> & h, std::vector<float> & out);
+static bool gate_scores(const ggml_tensor * w, const void * w_data, const std::vector<float> & h, std::vector<float> & out);
 
 // The prediction worker: everything it touches is either job-local or a read-only weight leaf, so
 // it needs no coordination with the graph, the source, or the LRU — the eval thread snapshots its
@@ -367,6 +375,12 @@ void RouterHook::predict_worker_main() {
             if (pred_stop_) return;
             job = std::move(pred_job_);
             pred_job_pending_ = false;
+            // Claim the worker-busy slot under the same lock that pops the job: from here until
+            // the store below, every predict_reset() (and destructor) will wait on pred_cv_idle_
+            // before mutating any member this job is about to read. The job is a private copy —
+            // pred_row_ / pred_scores_ / gate_w_host_ are shared, which is exactly what the claim
+            // protects.
+            worker_busy_ = true;
         }
         std::vector<float> scores;
         // Time the GEMV itself (the ranking that follows is O(k*n_expert) and rides along): this
@@ -385,14 +399,23 @@ void RouterHook::predict_worker_main() {
 #if defined(__aarch64__)
         if (job.commit && job.nl >= 0 && quantize_gate(job.nl)) scored = gate_scores_q(job.nl, job.row, scores);
 #endif
-        if (!scored) scored = job.gate && gate_scores(job.gate, job.row, scores);
+        if (!scored) scored = job.gate && gate_scores(job.gate, gate_w_host(job.nl), job.row, scores);
         if (job.commit) {
             ra_gemv_ns_.fetch_add(
                 (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tg0)
                     .count());
             ra_gemv_jobs_.fetch_add(1);
         }
-        if (!scored) continue;
+        if (!scored) {
+            // Release the busy claim before looping for the next job; a reset (or the destructor)
+            // waiting on pred_cv_idle_ may now proceed.
+            {
+                std::lock_guard<std::mutex> lk(pred_mtx_);
+                worker_busy_ = false;
+            }
+            pred_cv_idle_.notify_all();
+            continue;
+        }
         PredictResult r;
         r.seq = job.seq;
         r.nl = job.nl;
@@ -441,18 +464,40 @@ void RouterHook::predict_worker_main() {
         if (!job.commit && source_ && source_->supports_active_prefetch() && !r.spec.empty() && job.nl >= 0) {
             source_->enqueue_predicted_ids(job.nl, r.spec.data(), (int) r.spec.size());
         }
-        std::lock_guard<std::mutex> lk(pred_mtx_);
-        pred_result_ = std::move(r);
+        {
+            std::lock_guard<std::mutex> lk(pred_mtx_);
+            pred_result_ = std::move(r);
+            // Release the busy claim: the result is published, so a reset waiting on
+            // pred_cv_idle_ can now safely mutate the shared members this iteration read.
+            worker_busy_ = false;
+        }
+        pred_cv_idle_.notify_all();
     }
 }
 
 // Copy one token's row out of a 2-D activation as float, honouring the strides (the row may be a
 // view). Returns false for a dtype the probe does not read, which is how an unsupported model
 // declines the measurement instead of reporting a wrong one.
+//
+// The tensor may be DEVICE-resident: with -ngl on a CUDA-resident model the gate input lives in the
+// CUDA compute buffer, whose data pointer is not host-readable (a host read faults — measured
+// 0x4d380 under --predict-prefetch). The row is copied to a host scratch through the backend API
+// first, exactly as the topk gather already does. Host-resident tensors keep the direct walk.
 static bool row_to_float(const ggml_tensor * t, int j, std::vector<float> & out) {
     const int64_t n = t->ne[0];
     if (n <= 0) return false;
-    const char * row = (const char *) t->data + (size_t) j * t->nb[1];
+    if (j < 0 || j >= (int64_t) t->ne[1]) return false;
+    const bool on_gpu = t->buffer && !ggml_backend_buffer_is_host(t->buffer);
+    const size_t row_bytes = (size_t) n * ggml_element_size(t);
+    std::vector<char> scratch;
+    const char * row = nullptr;
+    if (on_gpu) {
+        scratch.resize(row_bytes);
+        ggml_backend_tensor_get(t, scratch.data(), (size_t) j * t->nb[1], row_bytes);
+        row = scratch.data();
+    } else {
+        row = (const char *) t->data + (size_t) j * t->nb[1];
+    }
     out.assign((size_t) n, 0.0f);
     if (t->type == GGML_TYPE_F32) {
         for (int64_t d = 0; d < n; ++d)
@@ -467,9 +512,36 @@ static bool row_to_float(const ggml_tensor * t, int j, std::vector<float> & out)
     return false;
 }
 
-// The router's own arithmetic: one score per expert, from a gate matrix [n_embd, n_expert] and a
-// gate input row. This is the whole prediction — the same GEMV the graph will do a layer later,
-// done early on an input that has not finished changing.
+// Host-safe gate matrix pointer for layer il: the tensor's own data if host-resident, else the
+// per-layer mirror, filled lazily on first use. The gate matrix is a static weight leaf, so one
+// fill per layer is exact.
+//
+// Threading: the mirror is filled by whoever needs it first (eval-thread watchdog or the
+// prediction worker), serialized under pred_mtx_. The returned pointer is used AFTER the lock is
+// released, so a later fill for the SAME layer must not reallocate the mirror while an earlier
+// reader still walks it. That is why the guard is `if empty, resize + fill, THEN publish`: the
+// published size is final, and no caller ever resizes a non-empty mirror (the tensor is a static
+// leaf, so a repointed gate would be a different layer's node, not a re-fill of this one).
+const void * RouterHook::gate_w_host(int il) {
+    if (il < 0 || il >= n_layer_) return nullptr;
+    const ggml_tensor * w = gate_w_[il];
+    if (!w || !w->data) return nullptr;
+    if (!w->buffer || ggml_backend_buffer_is_host(w->buffer)) return w->data;
+    std::lock_guard<std::mutex> lk(pred_mtx_);
+    auto & mir = gate_w_host_[il];
+    if (mir.empty()) {
+        const size_t bytes = (size_t) w->ne[0] * w->ne[1] * ggml_element_size(w);
+        if (bytes == 0) return nullptr;
+        mir.resize(bytes);
+        ggml_backend_tensor_get(w, mir.data(), 0, bytes);
+    }
+    return mir.data();
+}
+
+// One score per expert, from a gate matrix [n_embd, n_expert] and a gate input row. This is the
+// whole prediction — the same GEMV the graph will do a layer later, done early on an input that has
+// not finished changing. `w_data` is a HOST-safe pointer to the matrix (may differ from w->data on
+// a device-resident model).
 //
 // The F16 path matters more than it looks. ggml_fp16_to_fp32 is an exported function, not an
 // inlinable conversion, so the obvious loop pays a function call per weight element — 21M calls
@@ -486,7 +558,7 @@ static bool row_to_float(const ggml_tensor * t, int j, std::vector<float> & out)
 // the difference between a win and a rout. The partial sums change the summation order, so the
 // last bits of a score may differ from the graph's own gate; the ranking is unaffected in every
 // case that is not already a numerical tie, and the watchdog is what would catch it if it were.
-static bool gate_scores(const ggml_tensor * w, const std::vector<float> & h, std::vector<float> & out) {
+static bool gate_scores(const ggml_tensor * w, const void * w_data, const std::vector<float> & h, std::vector<float> & out) {
     const int64_t nd = w->ne[0], ne = w->ne[1];
     if (nd != (int64_t) h.size() || ne <= 0) return false;
     if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16) return false;
@@ -494,7 +566,7 @@ static bool gate_scores(const ggml_tensor * w, const std::vector<float> & h, std
     const float * hp = h.data();
     const int64_t nd4 = nd & ~(int64_t) 3;
     for (int64_t e = 0; e < ne; ++e) {
-        const char * row = (const char *) w->data + (size_t) e * w->nb[1];
+        const char * row = (const char *) w_data + (size_t) e * w->nb[1];
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
         if (w->type == GGML_TYPE_F32) {
             const float * p = (const float *) row;
@@ -697,7 +769,7 @@ void RouterHook::route_ahead_submit(ggml_tensor * ids, int il, int nu, int nt) {
         // The sampled control is an exact float GEMV on the EVAL thread — cheap because it is
         // sampled, but it lives in the compute residual, so it carries its own meter.
         const auto tw0 = std::chrono::steady_clock::now();
-        if (gate_w_[il] && row_to_float(h, j, pred_row_) && gate_scores(gate_w_[il], pred_row_, pred_scores_)) {
+        if (gate_w_[il] && row_to_float(h, j, pred_row_) && gate_scores(gate_w_[il], gate_w_host(il), pred_row_, pred_scores_)) {
             std::vector<int32_t> ctrl;
             rank_top_k(pred_scores_, nu, ctrl);
             int hits = 0;
@@ -893,12 +965,12 @@ void RouterHook::predict_at_logits(ggml_tensor * t, int il) {
     // to reproduce the routing the graph is about to compute from those very two tensors, so it is
     // also the check that this GEMV agrees with llama.cpp's. Probe-only — the prefetch has no use
     // for a prediction of the layer it is already standing in, and skipping it halves the tax.
-    if (predict_log_ && gate_w_[il] && gate_scores(gate_w_[il], pred_row_, pred_scores_))
+    if (predict_log_ && gate_w_[il] && gate_scores(gate_w_[il], gate_w_host(il), pred_row_, pred_scores_))
         rank_top_k(pred_scores_, predict_max_k, pred_self_[il]);
 
     // Stale-gate: the NEXT layer's matrix on this layer's input — the prediction under test. Silent
     // on the first token of a run, whose next layer has not been seen yet; score_layer counts those.
-    if (nl < n_layer_ && gate_w_[nl] && gate_scores(gate_w_[nl], pred_row_, pred_scores_))
+    if (nl < n_layer_ && gate_w_[nl] && gate_scores(gate_w_[nl], gate_w_host(nl), pred_row_, pred_scores_))
         rank_top_k(pred_scores_, predict_max_k, pred_stale_[nl]);
 
     // Stale-2: the matrix two layers ahead on the same input — the accuracy the ASYNC prefetch
@@ -907,7 +979,7 @@ void RouterHook::predict_at_logits(ggml_tensor * t, int il) {
     const int n2 = il + 2;
     if (predict_log_ && n2 < n_layer_) {
         pred_stale2_[n2].clear();
-        if (gate_w_[n2] && gate_scores(gate_w_[n2], pred_row_, pred_scores_))
+        if (gate_w_[n2] && gate_scores(gate_w_[n2], gate_w_host(n2), pred_row_, pred_scores_))
             rank_top_k(pred_scores_, predict_max_k, pred_stale2_[n2]);
     }
 }
@@ -972,7 +1044,7 @@ void RouterHook::predict_at_topk(ggml_tensor * t, int il, int nu, int nt) {
     // buffer between the gate matmul and here, or the architecture does not select by raw-logit
     // ranking, the control collapses and the prefetch disarms instead of speculating on noise.
     if (++wd_rout_ % wd_interval == 0 && gate_w_[il] && row_to_float(h, j, pred_row_) &&
-        gate_scores(gate_w_[il], pred_row_, pred_scores_)) {
+        gate_scores(gate_w_[il], gate_w_host(il), pred_row_, pred_scores_)) {
         std::vector<int32_t> ctrl;
         rank_top_k(pred_scores_, nu, ctrl);
         const int32_t * actual = gathered_.data() + (size_t) (nt - 1) * nu;

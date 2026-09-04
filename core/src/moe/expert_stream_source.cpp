@@ -435,6 +435,11 @@ void ExpertStreamSource::io_worker(int lane) {
 // given experts of layer il. LRU-safe (same thread as load_layer); workers only read the bytes.
 void ExpertStreamSource::prefetch(int il, const int32_t * ids, int n_ids) {
     if (!active_ || cache_max_ == 0 || il < 0 || il >= n_layer_ || !layers_[il].bound || !ids || n_ids <= 0) return;
+    // Pinned (hybrid static offload) layers have no host-side lbuf_ — load_layer never allocates
+    // one for them (they are VRAM-resident already) — so a speculative read's dst would be null
+    // and vm_commit(nullptr) succeeds as a fresh allocation, shipping a job FileReader::read then
+    // memcpys into address 0. They are resident by definition; there is nothing to prefetch.
+    if (cuda_stager_.is_layer_pinned(il)) return;
     const LayerExperts & L = layers_[il];
     bool any = false;
 
@@ -552,6 +557,9 @@ void ExpertStreamSource::enable_active_prefetch() {
 void ExpertStreamSource::enqueue_predicted_ids(int il, const int32_t * ids, int n_ids) {
     if (!active_ || cache_max_ == 0 || il < 0 || il >= n_layer_ || !ids || n_ids <= 0) return;
     if (!pred_ids_enabled_ || !layers_[il].bound) return;
+    // A pinned layer (hybrid static offload) has no host lbuf_ to read into; it is VRAM-resident
+    // by definition, so a predicted read would be a null-dst job (see prefetch()). Skip it.
+    if (cuda_stager_.is_layer_pinned(il)) return;
     std::lock_guard<std::mutex> lk(io_mtx_);
     // Bounded: drop the oldest if the queue is full (a burst of predictions must not overwhelm
     // the lanes, and the newest prediction is the most likely to be relevant).
@@ -585,6 +593,10 @@ void ExpertStreamSource::drain_spec(int lane, uint64_t worker_seen) {
             while (pred_ids_next_ < pred_ids_.size() && !staged_pred) {
                 const auto [id, pil] = pred_ids_[pred_ids_next_++];
                 if (cvalid_[id] || spec_remaining_[id] != 0) continue; // superseded; skip
+                // A pinned target layer has no host lbuf_ (VRAM-resident); its predicted entries
+                // must never reach the lanes — dst would be null and vm_commit(nullptr) succeeds,
+                // shipping a null-dst read. Belt-and-braces behind the enqueue/queue guards.
+                if (cuda_stager_.is_layer_pinned(pil)) continue;
                 const int e = id % n_expert_;
                 // Commit pages + build jobs (same staging as prefetch()). This is the LANE's own
                 // scratch (spec_pred_stage_), NOT spec_stage_ — the eval thread's prefetch() uses

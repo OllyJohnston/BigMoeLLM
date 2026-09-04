@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.27.1] - 2026-09-04
+
+### Fixed
+- **Crash under `--predict-prefetch` with hybrid static offload (`--n-pinned-layers`).** The
+  prediction worker's speculative read path assumed every layer index appeared in the host
+  `lbuf_` ring. With early MoE layers pinned to VRAM, pinned layers have `layers_[il].bound ==
+  true` but a *null* host `lbuf_[p][il]` (the load path skips them). The lane-direct staging
+  loop then computed `dst = lbuf_[p][pil] + e*slice` = a null base, and the commit step ran
+  `VirtualAlloc(NULL, MEM_COMMIT)`, which succeeds at a system-chosen address — so a read job
+  with a null destination reached the I/O lanes and `FileReader::read` faulted writing to 0x0.
+  Proven with cdb: `VCRUNTIME140!memcpy_repmovs (WRITE to 0x0)` ← `FileReader::read` ←
+  `drain_spec` ← `io_worker`. Pinned layers are always resident, so speculation is pointless for
+  them: `prefetch()`, `enqueue_predicted_ids()` and the `drain_spec` staging loop now early-return
+  for `cuda_stager_.is_layer_pinned(il)`. Gates (which use unpinned tiny-moe models) could not
+  catch this; the crash was live-only.
+
+### Changed
+- **Engine version 0.27.1.** `project(VERSION)` bumped from 0.27.0.
+
 ## [0.27.0] - 2026-09-03
 
 ### Added

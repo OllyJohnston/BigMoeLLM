@@ -34,6 +34,33 @@ cd build && ctest --output-on-failure         # byte-identity gates (needs pytho
 Android CLI: `pwsh scripts/build-android.ps1` (needs the NDK), then build the APK in
 `examples/android`.
 
+## Debug tooling (Windows host)
+
+- **WinDbg / cdb (Windows SDK Debuggers)** — `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\`
+  (`WinDbgX.exe`, `cdb.exe`, `gflags.exe`, `kd.exe`). `cdb.exe` runs non-interactively
+  *without* elevation: `cdb -o -g -G -logo <log> -cf <script> <exe> <args>` with a script
+  like `sxe -c "!analyze -v; .reload; k; q" av; g` is the proven recipe for crash
+  triage. `!analyze -v` on a `0xC0000005` dump/resolve gives faulting call chain
+  (used to prove the pinned-layer `memcpy` to 0x0).
+- **gflags.exe** (same dir) can enable PageHeap (`gflags /p /enable <exe> /full`) but
+  writes `HKLM\...\Image File Execution Options` — **requires an elevated shell**.
+- **dumpbin** — MSVC toolchain: `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\dumpbin.exe`
+  (`/DISASM` for offsets, `/HEADERS` for the RSDS PDB reference). Pairs with
+  ASLR-relative decoding against runtime module bases.
+- **DbgHelp** (`dbghelp.dll`, `SymFromAddr` + `SYMOPT_LOAD_LINES`) resolves Release
+  PDBs as long as the link step emits them; `build/` is regenerated so flipping a
+  `vcxproj`'s `GenerateDebugInformation` is fine for one diagnostic pass.
+- Release builds ship with no PDBs by default; when stack symbols matter, flip the
+  target's `<GenerateDebugInformation>` to `true`, rebuild, resolve, then revert.
+- **Server readiness probe**: do NOT sleep-poll `netstat` — `bmoe-server` answers
+  `GET /health` (auth required, `Authorization: Bearer <key>`) as soon as the accept
+  loop is up. Use a retry loop with a deadline (3 min works for a 35B load):
+  `curl.exe -s -o NUL -w "%{http_code}" -m 2 -H "Authorization: Bearer <key>" http://127.0.0.1:<port>/health`
+  repeated until it returns `200`, then proceed; check the stderr log if the deadline
+  expires (startup can also fail early on config validation, which exits non-zero).
+  In PowerShell: `Start-Process -WindowStyle Hidden -PassThru -RedirectStandardOutput/Error` +
+  the loop above; kill via `Stop-Process -Id $p.Id` when done.
+
 ## Hard rules
 
 1. **Never patch llama.cpp in-tree.** Everything goes through the public eval-callback and

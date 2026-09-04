@@ -275,6 +275,16 @@ private:
     bool predict_log_ = false;
     bool predict_prefetch_ = false;
     std::vector<ggml_tensor *> gate_w_;
+    // Host mirror of a DEVICE-resident gate matrix, per layer. gate_w_ points into the CUDA
+    // compute buffer on a -ngl run — its data is not host-readable (the worker's gate_scores
+    // faults reading it: measured 0x49526). The mirror is a byte copy made once at stash time on
+    // the eval thread (weights are static); the worker only reads it after submission.
+    // Empty = the layer's matrix is host-resident; use gate_w_[il]->data directly.
+    std::vector<std::vector<uint8_t>> gate_w_host_;
+    // Host-safe pointer to layer il's gate matrix; fills the mirror lazily on first use under
+    // pred_mtx_ (safe from both the eval thread and the worker). Returns nullptr if the layer has
+    // no matrix stashed.
+    const void * gate_w_host(int il);
     std::vector<std::vector<int32_t>> pred_stale_;  // per layer, ranked one layer early
     std::vector<std::vector<int32_t>> pred_stale2_; // per layer, ranked TWO layers early (probe only)
     std::vector<std::vector<int32_t>> pred_self_;   // per layer, ranked from its own logits
@@ -329,6 +339,11 @@ private:
     std::thread pred_worker_;
     std::mutex pred_mtx_;
     std::condition_variable pred_cv_;
+    // Signalled when the prediction worker completes an iteration and releases its busy claim.
+    // predict_reset() waits on it: a reset mutates the mirrors and stashes the worker reads, so it
+    // may only proceed when no job is in flight. Signalled from the worker's exit paths only.
+    std::condition_variable pred_cv_idle_;
+    bool worker_busy_ = false; // true while a job executes; its inputs/outputs are live
     PredictJob pred_job_;
     PredictResult pred_result_;
     bool pred_job_pending_ = false;
