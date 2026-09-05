@@ -852,6 +852,7 @@ static void print_usage(const char * argv0) {
                 "  --overlap, --io-two-wave, --route-ahead,\n"
                 "  --temp, --top-k, --top-p, --seed,\n"
                 "  --mtp, --ngram, --draft, --mtp-p-min, --spec-mtp-cr-depth, --spec-draft-adaptive, --ngram-min-match,\n"
+                "  --model-draft FILE, --n-gpu-layers-draft N, --spec-type draft-mtp|draft,\n"
                 "  --n-expert-used, --load-all\n"
                 "  --no-think           disable model thinking\n"
                 "\n"
@@ -993,6 +994,25 @@ int main(int argc, char ** argv) {
             cfg.spec.cr_depth = std::atoi(next("--spec-mtp-cr-depth"));
         else if (a == "--spec-draft-adaptive")
             cfg.spec.draft_adaptive = true;
+        else if (a == "-md" || a == "--model-draft") {
+            cfg.spec.model_draft = next("-md");
+            if (cfg.spec.source == DraftSource::none)
+                cfg.spec.source = DraftSource::mtp;
+        } else if (a == "-ngld" || a == "--n-gpu-layers-draft")
+            cfg.spec.n_gl_draft = std::atoi(next("-ngld"));
+        else if (a == "--spec-type") {
+            const std::string st = next("--spec-type");
+            if (st != "draft-mtp" && st != "draft") {
+                std::fprintf(stderr, "bmoe-server: --spec-type must be 'draft-mtp' or 'draft'\n");
+                return 2;
+            }
+            if (cfg.spec.enabled() && cfg.spec.source != DraftSource::mtp) {
+                std::fprintf(stderr, "bmoe-server: --spec-type conflicts with --ngram; choose one.\n");
+                return 2;
+            }
+            cfg.spec.source = DraftSource::mtp;
+            cfg.spec.driver = st == "draft" ? SpecDriver::simple : SpecDriver::mtp;
+        }
         else if (a == "--ngram-min-match")
             cfg.spec.ngram_min_match = std::atoi(next("--ngram-min-match"));
         else if (a == "-ctk" || a == "--cache-type-k")

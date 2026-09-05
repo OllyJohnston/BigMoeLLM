@@ -89,9 +89,27 @@ ValidationResult validate(const RunConfig & cfg) {
                     "no meaning for the n-gram source, which has no probabilities — its confidence gate "
                     "is spec.ngram_min_match.");
     }
-    if (cfg.spec.is_ngram() && cfg.spec.cr_depth != -1) {
+if (cfg.spec.is_ngram() && cfg.spec.cr_depth != -1) {
         return fail("spec.cr_depth is an MTP knob (the recurrent-state rollback depth) and has no "
-                    "meaning for the n-gram source, which keeps no draft-side state to compact.");
+                    "meaning for the n-gram source; it must stay -1 (off).");
+    }
+    // The detached head is MTP-only: it IS the trained nextn block in a separate gguf. The n-gram
+    // source drafts from text and has no head to attach.
+    if (cfg.spec.is_ngram() && !cfg.spec.model_draft.empty()) {
+        return fail("spec.model_draft is an MTP knob (a detached NextN head gguf) and has no meaning "
+                    "for the n-gram source; it must stay empty.");
+    }
+    // A detached head without the MTP source is a silent no-op otherwise — nothing would read the
+    // file, and an empty path is indistinguishable from "not set" for the n-gram check above.
+    if (!cfg.spec.is_mtp() && !cfg.spec.model_draft.empty()) {
+        return fail("spec.model_draft requires spec.source = mtp (--model-draft needs --mtp or "
+                    "--spec-type draft-mtp).");
+    }
+    // The standalone-draft-model driver has no head to attach to the target: the draft model IS
+    // the whole thing, so it must be given explicitly.
+    if (cfg.spec.is_mtp() && cfg.spec.driver == SpecDriver::simple && cfg.spec.model_draft.empty()) {
+        return fail("spec.driver = simple (--spec-type draft) requires a standalone draft model "
+                    "via spec.model_draft (--model-draft); it cannot self-speculate.");
     }
     if (cfg.spec.is_ngram() &&
         (cfg.spec.ngram_max_match < 1 || cfg.spec.ngram_max_match > SpecConfig::ngram_match_limit)) {

@@ -243,6 +243,15 @@ enum class DraftSource {
     ngram, // prompt-lookup over prompt + generated tokens (needs nothing from the model)
 };
 
+// Which llama.cpp speculative driver an MTP source uses when model_draft is set.
+// --spec-type draft-mtp = the trained NextN head (COMMON_SPECULATIVE_TYPE_DRAFT_MTP).
+// --spec-type draft     = a standalone autoregressive draft model (DRAFT_SIMPLE): a full small
+//                         model in its own gguf, sampled greedily for candidates. Needs model_draft.
+enum class SpecDriver {
+    mtp,
+    simple,
+};
+
 // Self-speculative decoding: draft draft_max continuation tokens, then verify all of them in ONE
 // decode and accept the longest prefix whose argmax agrees with the draft. Nothing is approximated
 // and no weight is skipped, so this is a latency optimisation, not a quality trade.
@@ -263,6 +272,23 @@ enum class DraftSource {
 // choice of source cannot change. Default off until the A/B says otherwise on the target device.
 struct SpecConfig {
     DraftSource source = DraftSource::none;
+
+    // Detached MTP draft head (--model-draft). Empty (the default) self-speculates: the draft
+    // context reuses the target model and reads its nextn block from the same gguf. When set,
+    // the head lives in its own gguf (e.g. unsloth/AtomicChat mtp-*.gguf sidecars): open() loads
+    // it into a separate llama_model (borrowing the target's embeddings/lm head when the export
+    // marks nextn_shared_target_tensors), validates the head's hidden width against the target,
+    // and creates the MTP draft context from it. MTP source only - validate() rejects it with
+    // the n-gram source.
+    std::string model_draft;
+    // Standalone-draft-model driver when model_draft is set: the trained NextN head (mtp, the
+    // default) or a full autoregressive draft model (simple, --spec-type draft). Ignored when
+    // model_draft is empty (self-speculation is always the MTP driver).
+    SpecDriver driver = SpecDriver::mtp;
+    // Draft head layer offload. -1 (the default) inherits the target's n_gpu_layers; anything
+    // else offloads exactly that many of the head's layers, independent of the target's split so
+    // a small head does not force the target's expert budget. Ignored when model_draft is empty.
+    int n_gl_draft = -1;
 
     // Tokens drafted per verify batch. The verify decode is 1 + draft_max positions wide, so this
     // sets both the ceiling on tokens-per-decode and the width of the read-set widening above.

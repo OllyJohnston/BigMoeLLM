@@ -426,6 +426,14 @@ static void print_usage(const char * argv0) {
         "                          the context reserves\n"
         "      --spec-draft-adaptive  size each draft from measured acceptance instead of always\n"
         "                          drafting --draft tokens (MTP; off by default)\n"
+        "      --model-draft FILE  load the MTP head (or a standalone draft model) from its own gguf\n"
+        "                          (default: self-speculate over the base gguf). Needs --mtp or\n"
+        "                          --spec-type\n"
+        "      --spec-type draft-mtp|draft  draft-mtp = trained NextN head in --model-draft; draft =\n"
+        "                          standalone autoregressive draft model in --model-draft (full small\n"
+        "                          model, gated greedy candidates, needs --model-draft)\n"
+        "      --n-gpu-layers-draft N  layers of the detached draft offloaded to the GPU\n"
+        "                          (default -1 = inherit the base's offload/VRAM budget)\n"
         "      --ngram-min-match N --ngram only: shortest run of matching tokens allowed to draft\n"
         "                          (default 3). The confidence gate: raise it for fewer, better\n"
         "                          drafts, lower it for coverage\n"
@@ -647,6 +655,25 @@ int main(int argc, char ** argv) {
             cfg.spec.cr_depth = std::atoi(next("--spec-mtp-cr-depth"));
         else if (a == "--spec-draft-adaptive")
             cfg.spec.draft_adaptive = true;
+        else if (a == "-md" || a == "--model-draft") {
+            cfg.spec.model_draft = next("-md");
+            if (cfg.spec.source == DraftSource::none)
+                cfg.spec.source = DraftSource::mtp;
+        } else if (a == "-ngld" || a == "--n-gpu-layers-draft")
+            cfg.spec.n_gl_draft = std::atoi(next("-ngld"));
+        else if (a == "--spec-type") {
+            const std::string st = next("--spec-type");
+            if (st != "draft-mtp" && st != "draft") {
+                std::fprintf(stderr, "bmoe: --spec-type must be 'draft-mtp' or 'draft'\n");
+                return 2;
+            }
+            if (cfg.spec.enabled() && cfg.spec.source != DraftSource::mtp) {
+                std::fprintf(stderr, "bmoe: --spec-type conflicts with --ngram; choose one.\n");
+                return 2;
+            }
+            cfg.spec.source = DraftSource::mtp;
+            cfg.spec.driver = st == "draft" ? SpecDriver::simple : SpecDriver::mtp;
+        }
         else if (a == "--ngram-min-match")
             cfg.spec.ngram_min_match = std::atoi(next("--ngram-min-match"));
         else if (a == "-ctk" || a == "--cache-type-k")

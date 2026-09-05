@@ -411,14 +411,20 @@ struct Session::Impl {
     std::unique_ptr<RouterHook> hook; // heap: its address is baked into cparams.cb_eval_user_data
     ExpertStreamSource source;
 
-    // The MTP draft source (SpecConfig::source == mtp). A SECOND context over the SAME model,
-    // created with ctx_type = MTP so llama.cpp builds the nextn graph instead of the trunk one. It
-    // carries the same eval callback as the target — the hook is per-context, not per-model — so the
-    // MTP block's expert layer is captured and streamed by the one source both contexts share.
+    // The MTP draft source (SpecConfig::source == mtp). Created with ctx_type = MTP so llama.cpp
+    // builds the nextn graph instead of the trunk one. It carries the same eval callback as the
+    // target — the hook is per-context, not per-model — so the MTP block's expert layer is captured
+    // and streamed by the one source both contexts share.
+    //
+    // Self-speculation (SpecConfig::model_draft empty) reuses `model` above. With a detached head
+    // (--model-draft), model_dft owns the head's weights and ctx_dft is created from it. Declared
+    // BEFORE ctx_dft so teardown (reverse member order) frees the context before the model that
+    // backs it.
     //
     // The n-gram source has no equivalent state: it drafts from the token history alone, which is
     // why it costs no context, no memory and no expert read. Everything below this pair is shared by
     // both sources, because the verify half of the loop does not care who drafted.
+    std::unique_ptr<llama_model, void (*)(llama_model *)> model_dft{nullptr, llama_model_free};
     std::unique_ptr<llama_context, void (*)(llama_context *)> ctx_dft{nullptr, llama_free};
     common_speculative_ptr mtp;
     // Serves both roles on the speculative path, never both at once: a prefill chunk (up to
@@ -679,19 +685,72 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     if (!model) return fail("failed to load model: " + cfg.model_path);
     im.model.reset(model);
 
+    // A detached draft head/model (--model-draft) ships in its own gguf (e.g. the
+    // unsloth/AtomicChat mtp-*.gguf sidecars). Load it into a separate model now, before any nextn
+    // count is read: a truly detached base gguf carries no nextn block, so the count must come from
+    // the head. Two drivers share the flag:
+    //
+    //   SpecDriver::mtp    — the trained NextN head. It borrows the target's embeddings/lm head
+    //                        when the export marks nextn_shared_target_tensors (the borrow is inert
+    //                        otherwise), and its h_nextn width must equal the target's or the
+    //                        speculative driver's GGML_ASSERT would abort the process.
+    //   SpecDriver::simple — a full autoregressive draft model. It owns its whole graph (no
+    //                        borrow); the only shared contract is the tokenizer, so the vocab must
+    //                        match the target's for draft tokens to be verifiable.
+    //
+    // The draft gets its own offload: n_gl_draft bounds it independently of the target's expert
+    // budget, which is what keeps a small sidecar off the WDDM paging path when the base already
+    // fills VRAM. MTP source only - validate() rejects model_draft with the n-gram source.
+    if (cfg.spec.is_mtp() && !cfg.spec.model_draft.empty()) {
+        const bool simple = cfg.spec.driver == SpecDriver::simple;
+        llama_model_params hmparams = llama_model_default_params();
+        hmparams.load_mode = LLAMA_LOAD_MODE_MMAP;
+        hmparams.use_extra_bufts = false;
+        if (simple) {
+            hmparams.model_shared = nullptr; // full standalone model; owns everything
+        } else {
+            hmparams.load_mtp = true; // the head IS the nextn block; without this its tensors are skipped
+            hmparams.model_shared = model;
+        }
+        hmparams.n_gpu_layers = cfg.spec.n_gl_draft >= 0 ? cfg.spec.n_gl_draft : cfg.n_gpu_layers;
+        llama_model * model_dft = llama_model_load_from_file(cfg.spec.model_draft.c_str(), hmparams);
+        if (!model_dft)
+            return fail("failed to load the detached MTP draft model '" + cfg.spec.model_draft + "'");
+        im.model_dft.reset(model_dft);
+        if (simple) {
+            // Full autoregressive draft: the vocab IS the contract (the driver samples candidates
+            // with the draft model's own logits and the target verifies them by token id).
+            if (llama_vocab_n_tokens(llama_model_get_vocab(model_dft)) !=
+                llama_vocab_n_tokens(llama_model_get_vocab(model))) {
+                return fail("standalone draft model '" + cfg.spec.model_draft + "' vocab size (" +
+                            std::to_string(llama_vocab_n_tokens(llama_model_get_vocab(model_dft))) +
+                            ") does not match the target (" +
+                            std::to_string(llama_vocab_n_tokens(llama_model_get_vocab(model))) + ")");
+            }
+        } else if (llama_model_n_embd_out(model_dft) != llama_model_n_embd_out(model)) {
+            return fail("MTP draft model '" + cfg.spec.model_draft + "' hidden width (" +
+                        std::to_string(llama_model_n_embd_out(model_dft)) + ") does not match the target (" +
+                        std::to_string(llama_model_n_embd_out(model)) + ")");
+        }
+    }
+
     im.vocab = llama_model_get_vocab(model);
     im.n_vocab = llama_vocab_n_tokens(im.vocab);
     im.n_layer = llama_model_n_layer(model);
     // Excluded from n_layer by llama.cpp, so ask for it separately. Zero on every model without a
     // trained MTP head — which is most ggufs, including quants of MTP-capable models that were
-    // converted without the nextn tensors.
-    im.n_layer_nextn = llama_model_n_layer_nextn(model);
-    if (cfg.spec.is_mtp() && im.n_layer_nextn <= 0)
-        return fail("--mtp needs a model with a trained MTP head, and this gguf has no nextn block "
-                    "(nextn_predict_layers is absent or zero). Qwen3.5/3.6 carry one in their "
-                    "ordinary quantisations; other architectures have none. --ngram speculates on any "
-                    "model, since it drafts from the text rather than from the weights. See "
-                    "docs/mtp.md and docs/ngram.md.");
+    // converted without the nextn tensors. With a detached MTP head the count comes from the head;
+    // a standalone draft model (SpecDriver::simple) has no nextn block by construction.
+    const bool simple_draft = cfg.spec.is_mtp() && cfg.spec.driver == SpecDriver::simple;
+    if (!simple_draft) {
+        im.n_layer_nextn = llama_model_n_layer_nextn(im.model_dft ? im.model_dft.get() : model);
+        if (cfg.spec.is_mtp() && im.n_layer_nextn <= 0)
+            return fail("--mtp needs a model with a trained MTP head, and neither the base gguf nor the "
+                        "--model-draft head has a nextn block (nextn_predict_layers is absent or zero). "
+                        "Qwen3.5/3.6 carry one in their ordinary quantisations; other architectures have "
+                        "none. --ngram speculates on any model, since it drafts from the text rather "
+                        "than from the weights. See docs/mtp.md and docs/ngram.md.");
+    }
 
     char arch[128] = {0};
     llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
@@ -722,8 +781,10 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     // The MTP block lives at layer index n_layer and routes experts of its own, so with speculation
     // on the hook and the streamer must span the trunk PLUS the head. The index space is contiguous
     // and the tensor naming identical, so this bound is the only thing standing between the streamer
-    // and the MTP experts — left at n_layer they are silently skipped and stay mmap-resident.
-    const int n_layer_streamed = im.n_layer + (cfg.spec.is_mtp() ? im.n_layer_nextn : 0);
+    // and the MTP experts — left at n_layer they are silently skipped and stay mmap-resident. A
+    // standalone draft model (SpecDriver::simple) has its own small experts under the target's arch
+    // and is fully offloaded under n_gl_draft, so the streamer stays trunk-only there.
+    const int n_layer_streamed = im.n_layer + ((cfg.spec.is_mtp() && !simple_draft) ? im.n_layer_nextn : 0);
     im.hook = std::make_unique<RouterHook>(recipe ? *recipe : MoeRecipe{}, n_layer_streamed);
     im.hook->set_prefetch_layers(cfg.moe.prefetch_layers);
     im.hook->set_drop_policy(cfg.moe.drop_cold_frac, cfg.moe.drop_renorm, cfg.moe.drop_prefill);
@@ -804,13 +865,28 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         }
     }
 
-    // The MTP draft context: same model, same eval callback, but ctx_type = MTP so llama.cpp builds
-    // the nextn graph. It keeps its own (single-position) KV, hence n_rs_seq = 0 — nothing is ever
-    // rolled back on the draft side, the target is the one that speculates.
+    // The MTP draft context: same-target self-speculation keeps the model and builds the nextn graph
+    // (ctx_type = MTP); a detached head (--model-draft, SpecDriver::mtp) builds it over the head's
+    // model; a standalone draft model (SpecDriver::simple) is a plain trunk context over its own
+    // model. It keeps its own (single-position) KV, hence n_rs_seq = 0 — nothing is ever rolled
+    // back on the draft side, the target is the one that speculates.
     if (cfg.spec.is_mtp()) {
         llama_context_params dparams = cparams;
-        dparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        dparams.ctx_type = simple_draft ? LLAMA_CONTEXT_TYPE_DEFAULT : LLAMA_CONTEXT_TYPE_MTP;
         dparams.n_rs_seq = 0;
+        // A detached MTP head is a second model riding on the target's states: the MTP graph reads
+        // h_nextn from the target's memory, so point the draft context at the target context.
+        // Self-speculation leaves it null — one model, two contexts, and llama.cpp already wires
+        // them (the fork's MTP driver sets ctx_other itself for the shared-model case). A
+        // standalone draft model never touches the target's memory: it reads its own tokens only.
+        if (im.model_dft && !simple_draft) dparams.ctx_other = ctx;
+        // The draft model's streamer: the MTP head's experts are streamed by the one shared source
+        // (layer indices are contiguous with the trunk), but a standalone draft model is small and
+        // fully offloaded under n_gl_draft — no streaming, keep it simple.
+        if (simple_draft) {
+            dparams.cb_eval = nullptr;
+            dparams.cb_eval_user_data = nullptr;
+        }
         // Compute buffers are reserved for the WIDEST ubatch, and left at the target's width the
         // draft context reserves gigabytes for a graph it never runs: the widest thing it ever
         // computes is a prefill chunk, and at decode time it is 1 + draft_max positions. On this
@@ -823,7 +899,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         // into ubatches of the width below.
         dparams.n_ubatch = (uint32_t) std::max(cfg.spec.draft_max + 1, mtp_draft_ubatch);
         if (dparams.n_ubatch > cparams.n_ubatch) dparams.n_ubatch = cparams.n_ubatch;
-        llama_context * ctx_dft = llama_init_from_model(model, dparams);
+        llama_context * ctx_dft = llama_init_from_model(im.model_dft ? im.model_dft.get() : model, dparams);
         if (!ctx_dft) return fail("failed to create the MTP draft context");
         im.ctx_dft.reset(ctx_dft);
         llama_set_n_threads(ctx_dft, cfg.n_threads, cfg.n_threads);
@@ -855,7 +931,10 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     // session. Capturing the graph it actually runs beats capturing the one it briefly had.
     if (cfg.spec.is_mtp()) {
         common_params_speculative sp;
-        sp.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+        // draft-mtp: the nextn head. draft (standalone model): DRAFT_SIMPLE samples candidates with
+        // the draft model's own logits; both ride the same verify loop because a candidate is a
+        // candidate regardless of who produced it.
+        sp.types = {simple_draft ? COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE : COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
         sp.draft.n_max = cfg.spec.draft_max;
         sp.draft.n_min = 0; // never skip a whole draft; width is bounded by n_max and p_min below
         // The head's own confidence floor for continuing to draft. At 0 (the default) it drafts
@@ -871,7 +950,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         // Size each draft from measured acceptance instead of always drafting n_max. Off by
         // default; see SpecConfig::draft_adaptive.
         sp.draft.adaptive = cfg.spec.draft_adaptive;
-        sp.draft.ctx_tgt = ctx; // self-speculation: one model, two contexts over it
+        sp.draft.ctx_tgt = ctx; // the target context; draft ctx may be over the shared or the detached model
         sp.draft.ctx_dft = im.ctx_dft.get();
         im.mtp.reset(common_speculative_init(sp, /*n_seq*/ 1));
         if (!im.mtp) return fail("failed to initialise MTP speculative decoding");
@@ -1055,7 +1134,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         ri.n_ubatch = cfg.n_ubatch;
         ri.chatml = cfg.chatml;
         ri.compute_trace_layers = cfg.compute_trace_layers;
-        ri.spec = cfg.spec.is_mtp() ? "mtp" : cfg.spec.is_ngram() ? "ngram" : "off";
+        ri.spec = cfg.spec.is_mtp() ? (simple_draft ? "mtp-simple" : "mtp") : cfg.spec.is_ngram() ? "ngram" : "off";
         ri.spec_draft_max = cfg.spec.enabled() ? cfg.spec.draft_max : 0;
         ri.mtp_p_min = cfg.spec.is_mtp() ? cfg.spec.draft_p_min : 0.0f;
         ri.ngram_min_match = cfg.spec.is_ngram() ? cfg.spec.ngram_min_match : 0;

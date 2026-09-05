@@ -350,6 +350,36 @@ int main() {
         expect_ok("the same narrow ubatch is fine without speculation", c);
     }
 
+    // Detached draft ingestion: --model-draft is an MTP-only knob with its own source rule, and
+    // the standalone-draft-model driver cannot self-speculate.
+    {
+        RunConfig c = ok_base();
+        c.spec.source = DraftSource::mtp;
+        c.spec.model_draft = "mtp-head.gguf";
+        expect_ok("a detached MTP head with an explicit draft path is valid", c);
+        c.spec.n_gl_draft = 99;
+        expect_ok("the draft's own offload count is valid", c);
+        c.spec.n_gl_draft = -1;
+        c.spec.driver = SpecDriver::mtp;
+        expect_ok("the default driver (trained NextN head) is valid", c);
+        // The standalone-draft-model driver needs a model to draft with; it cannot self-speculate.
+        c.spec.driver = SpecDriver::simple;
+        c.spec.model_draft.clear();
+        expect_fail("the standalone draft driver without --model-draft is rejected", c);
+        c.spec.model_draft = "draft-tiny.gguf";
+        expect_ok("a standalone draft model with --model-draft is valid", c);
+        // The knob is MTP-only: a caller that sets it with the n-gram source has mixed a flag the
+        // chosen source cannot act on.
+        c.spec.source = DraftSource::ngram;
+        expect_fail("spec.model_draft is rejected with the n-gram source", c);
+        c.spec.source = DraftSource::mtp;
+        c.spec.model_draft.clear();
+        // And a detached path without the MTP source is a silent no-op otherwise.
+        c.spec.source = DraftSource::none;
+        c.spec.model_draft = "mtp-head.gguf";
+        expect_fail("spec.model_draft without the MTP source is rejected", c);
+    }
+
     if (failures == 0) {
         std::printf("all config checks passed\n");
         return 0;
