@@ -129,12 +129,20 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
 
 #if defined(BMOE_HAVE_CUDA)
     cuda_staging_enabled_ = false;
+    host_pinned_ = false;
     for (const LayerExperts & L : layers_) {
         if (!L.bound) continue;
         for (int p = 0; p < MoeRecipe::max_exps; ++p) {
-            if (L.proj[p].tensor && L.proj[p].tensor->buffer && !ggml_backend_buffer_is_host(L.proj[p].tensor->buffer)) {
+            if (!L.proj[p].tensor || !L.proj[p].tensor->buffer) continue;
+            if (!ggml_backend_buffer_is_host(L.proj[p].tensor->buffer)) {
                 cuda_staging_enabled_ = true;
                 break;
+            }
+            // A host buffer that is not the plain CPU buffer type is a DRIVER-PINNED
+            // host buffer (CUDA_Host / cudaMallocHost). We cannot tell cudaMallocHost and
+            // malloc apart via is_host, so compare against the CPU buffer type.
+            if (ggml_backend_buffer_get_type(L.proj[p].tensor->buffer) != ggml_backend_cpu_buffer_type()) {
+                host_pinned_ = true;
             }
         }
         if (cuda_staging_enabled_) break;
@@ -205,7 +213,11 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         for (int il = 0; il < n_layer_; ++il) {
             LayerExperts & L = layers_[il];
             if (!L.bound) continue;
-            if (cuda_stager_.is_layer_pinned(il)) continue;
+            if (cuda_stager_.is_layer_pinned(il)) {
+                // pinned by config: no lbuf_ here; the layer is GPU-resident and the
+                // scheduler routes its FFN nodes to the CUDA backend (BMOE-SCHED-01).
+                continue;
+            }
             for (int p = 0; p < MoeRecipe::max_exps; ++p) {
                 if (!L.proj[p].tensor) continue; // absent slot in a fused layout
                 const size_t full = (size_t) L.proj[p].nb2 * (size_t) n_expert_;
@@ -895,6 +907,12 @@ size_t ExpertStreamSource::entry_bytes(int il) const {
 // Release the physical pages fully contained in an entry's slices (never a partial page shared
 // with a neighbouring expert). Shared by eviction and by discarding an incomplete spec entry.
 void ExpertStreamSource::release_entry_pages(int32_t id) {
+    // A pinned (CUDA_Host / cudaMallocHost) buffer must never be MEM_DECOMMIT'ed: the driver
+    // keeps page-table references into it for async transfers, and decommitting it faults any
+    // in-flight copy (and the CPU graph workers that read the mapped slice) with an access
+    // violation. Pinned pages are not returnable to the OS anyway — the cache tracks them in
+    // the LRU but leaves their physical backing alone.
+    if (host_pinned_) return;
     const int il = id / n_expert_, e = id % n_expert_;
     for (int p = 0; p < MoeRecipe::max_exps; ++p) {
         const uint64_t slice = layers_[il].proj[p].nb2;

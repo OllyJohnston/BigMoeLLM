@@ -394,6 +394,12 @@ private:
 
     CudaExpertStager cuda_stager_;
     bool cuda_staging_enabled_ = false;
+    // True when the bound expert tensors live in a pinned (CUDA_Host / cudaMallocHost)
+    // buffer rather than a plain CPU buffer: `is_host` is true either way, so
+    // cuda_staging_enabled_ stays false, but calling MEM_DECOMMIT on pinned pages
+    // violates the CUDA driver contract and leaves stale page-table references during
+    // async transfers. Any slice in such a buffer must never be vm_evict'ed.
+    bool host_pinned_ = false;
 };
 
 

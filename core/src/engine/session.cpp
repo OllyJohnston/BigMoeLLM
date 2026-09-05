@@ -639,12 +639,39 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
 
         if (cfg.moe.enabled || cfg.moe.cpu_moe) {
             const int n_pinned = cfg.moe.n_pinned_layers;
+            // The n-gram / PLE tables must stay host-resident (they are huge and the streamer
+            // mmaps them); no_host prevents the loader's CPU-override from being rerouted onto a
+            // driver-pinned CUDA_Host buffer, keeping them on plain CPU buft (see below).
+            if (cfg.moe.cpu_moe) {
+                // --cpu-moe: expert weights execute on the CPU backend (op_offload = false), so
+                // layering them on a cudaMallocHost pin (CUDA_Host) is wrong on two counts: it
+                // commits ~3.7 GB of driver-pinned host RAM for no benefit, and — worse — the
+                // model loader rewrites the CPU override to the pinned buffer while the layers
+                // 0..n_pinned-1 (not covered by any override) stay on the CUDA0 device buft. The
+                // CPU compute then dereferences a device pointer as host memory, which faults the
+                // worker with an access violation before the first token. Forcing no_host makes
+                // every "override to CPU" resolve to the plain CPU buft, so the entire MoE stack
+                // executes host-resident and the device/host split never occurs.
+                mparams.no_host = true;
+            }
             ggml_backend_buffer_type_t target_buft = cfg.moe.cpu_moe ? ggml_backend_cpu_buffer_type() :
 #if defined(BMOE_HAVE_CUDA)
                 get_dummy_cuda_buft();
 #else
                 ggml_backend_cpu_buffer_type();
 #endif
+            if (cfg.moe.cpu_moe) {
+                // Option 2 (safe CPU path): resolve the pinned layers 0..n_pinned-1 to a plain
+                // CPU buffer as well, so the whole MoE stack computes host-resident. The loader
+                // normally places them on the CUDA0 device buft (since -ngl n>0 assigns every
+                // layer to the GPU); with op_offload=false the CPU backend then dereferences a
+                // device pointer as host memory and the decode faults before the first token.
+                // Their tensors are kept resident by the streamer's is_layer_pinned() skip — the
+                // "pin" is now a guarantee to never evict them, not a VRAM residency claim.
+                for (int il = 0; il < n_pinned; ++il) {
+                    buft_override_patterns.push_back("blk\\." + std::to_string(il) + "\\.ffn_.*exps.*");
+                }
+            }
             for (int il = n_pinned; il < 256; ++il) {
                 buft_override_patterns.push_back("blk\\." + std::to_string(il) + "\\.ffn_.*exps.*");
             }
