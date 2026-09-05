@@ -40,6 +40,14 @@ struct GgufOffsets {
 // split set. Returns ok=false if any file cannot be opened as gguf or a shard is missing.
 GgufOffsets read_gguf_offsets(const char * path);
 
+// Merge the tensors of a SECOND gguf file into `out` (a filled base-model parse) as an
+// appended file. Used for the detached MTP head (--model-draft): its blk.<n_layer>.nextn
+// expert tensors live in a separate file, and the streamer resolves them the same way as
+// the base's, at the appended file index. The head is never split, so this parses one
+// file. A name that already exists in `out` (a self-contained head carrying its own
+// token_embd) keeps the base's entry unchanged: the base gram is authoritative.
+void read_gguf_offsets_append(GgufOffsets & out, const char * path);
+
 // The handful of model metadata needed BEFORE the model is loaded: the architecture (to
 // build arch-prefixed metadata keys) and the MoE expert counts. Read via the public gguf
 // API, so no per-architecture constants leak into the engine — the arch string drives the

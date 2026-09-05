@@ -988,7 +988,12 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         }
         im.hook->end_capture();
 
-        const GgufOffsets & offs = meta().offsets;
+        // A detached MTP head carries its own blk.* expert tensors (fresh file indices off
+        // the append). Parse the base offsets first (meta() is lazy), then merge the head's
+        // tensors that the base does not have — exactly the MTP block's weights.
+        (void) meta();
+        if (im.model_dft) read_gguf_offsets_append(gguf_meta.offsets, cfg.spec.model_draft.c_str());
+        const GgufOffsets & offs = gguf_meta.offsets;
         if (!offs.ok) return fail("cannot read gguf offsets: " + cfg.model_path);
 
         std::vector<LayerExperts> layers = im.hook->captured();

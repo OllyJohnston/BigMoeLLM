@@ -144,6 +144,31 @@ GgufOffsets read_gguf_offsets(const char * path) {
     return out;
 }
 
+void read_gguf_offsets_append(GgufOffsets & out, const char * path) {
+    gguf_context * gctx = open_meta(path);
+    if (!gctx) {
+        std::fprintf(stderr, "bmoe: cannot read gguf offsets for the detached MTP head: %s\n", path);
+        out.ok = false;
+        return;
+    }
+    const int file_idx = (int) out.shard_paths.size();
+    const uint64_t data_off = (uint64_t) gguf_get_data_offset(gctx);
+    const int64_t n = gguf_get_n_tensors(gctx);
+    for (int64_t i = 0; i < n; ++i) {
+        const char * name = gguf_get_tensor_name(gctx, i);
+        // The base grammar is authoritative for a name both files carry (token_embd when a
+        // head is self-contained). Only tensors the base lacks — the head's blk.* experts —
+        // get the appended file's index.
+        if (out.off_by_name.find(name) == out.off_by_name.end()) {
+            out.off_by_name[name] = data_off + (uint64_t) gguf_get_tensor_offset(gctx, i);
+            out.size_by_name[name] = (uint64_t) gguf_get_tensor_size(gctx, i);
+            out.file_by_name[name] = file_idx;
+        }
+    }
+    out.shard_paths.push_back(path);
+    gguf_free(gctx);
+}
+
 GgufModelInfo read_gguf_model_info(const char * path) {
     GgufModelInfo out;
     if (gguf_context * gctx = open_meta(path)) {
