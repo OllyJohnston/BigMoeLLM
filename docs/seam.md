@@ -60,8 +60,16 @@ CPU MoE kernel invokes. The branch has since grown a small tail of related follo
 (async host-device copy for the gather, batched readahead, the MTP draft borrow, the qwen4exp
 nextn / NVMe prefetch work, the multi-token MoE fusion port for speculative decoding, the MTP
 compact-rollback / adaptive-draft port, the Qwen3.8-Flash-Next QSA gather port that bounds
-decode attention to the indexer-selected cells, and the batched grid-IQ panel GEMM that
-vectorizes CPU prefill for importance-matrix quantized models) - the
+decode attention to the indexer-selected cells, the batched grid-IQ panel GEMM that
+vectorizes CPU prefill for importance-matrix quantized models, the Qwen3.8-Flash-Next
+recurrent-state rollback port (PR #28123) that keeps rejected-draft rollback incremental
+instead of serializing the whole recurrent state to host memory, the draft-only-export load
+fix that lets a detached `mtp-*.gguf` head (whose trunk is absent) load with its trunk
+tensors marked `TENSOR_NOT_REQUIRED` plus the `hc_head_*`/`shared_head_*` mixer-name
+fallback, the scheduler fix that resolves view-backed weight buffers before the op-offload
+host check (fixing a NULL-buffer assert in `sched_reserve` under `op_offload=true`), and the
+qwen4exp unmasked-MTP export fix that defers the last-layer output-row gather until after the
+`t_h_nextn` export) - the
 *seam* itself is still exactly that one hook; everything else on the branch is llama.cpp-side
 performance work that the public API absorbs without touching `core/`.
 
@@ -235,18 +243,22 @@ If a future release moves the two hooks (a stable expert-residency API, say) ups
 this seam shrinks further or disappears — `core/` does not change.
 
 Pinned submodule at the time of writing: `OllyJohnston/llama.cpp` branch
-`bmoe/expert-ready-hook`, commit `5d00e641` - the expert-ready hook (section 3) plus the
+`bmoe/expert-ready-hook`, commit `d034a0aa` - the expert-ready hook (section 3) plus the
 follow-on work described above, on top of upstream `ggml-org/llama.cpp` master (base
 `b10680`, carrying the merged Qwen3.8-Flash-Next support), extended with the multi-token MoE
 fusion port (PR #27621 minus SWIGLU_CLAMP; see CHANGELOG 0.24.0), the MTP compact-rollback /
 adaptive-draft port (`--spec-mtp-cr-depth`, `--spec-draft-adaptive`; see `docs/mtp.md`), the
 Qwen3.8-Flash-Next QSA gather port (PR #27977; see CHANGELOG 0.25.0) that cuts decode
 attention from a full cache-window mask to the indexer-selected cells, and the batched grid-IQ
-panel GEMM (PR #27402; see CHANGELOG 0.26.0) that vectorizes CPU prefill for IQ models, and the
+panel GEMM (PR #27402; see CHANGELOG 0.26.0) that vectorizes CPU prefill for IQ models, the
 pass-1 scheduler guard (BMOE-SCHED-01; see CHANGELOG 0.27.4) that resolves weight buffers
 through `view_src` and pins any op whose weight lives in a non-host buffer to the owning
-backend, so a CPU op can never dereference a device tensor. The
-branch is pushed to the public `OllyJohnston/llama.cpp` fork, so the pin is reachable for any
+backend, so a CPU op can never dereference a device tensor, the Qwen3.8-Flash-Next
+recurrent-state rollback port (PR #28123; see CHANGELOG 0.28.0) plus the draft-only-export
+loader support and `hc_head_*` mixer naming for detached MTP heads, and the two crash fixes
+carried in the same bump (the `op_offload` `src->buffer` NULL deref in the scheduler and the
+unmasked-MTP `t_h_nextn` volume assert). The branch is pushed to the public
+`OllyJohnston/llama.cpp` fork, so the pin is reachable for any
 clone of this repo. Each bump gets its own fork branch and the previous ones stay, so every
 commit an old pin names remains reachable (see `.gitmodules` / `git submodule status` for the
 current pin).

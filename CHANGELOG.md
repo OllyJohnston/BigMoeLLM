@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.28.0] - 2026-09-05
+
+### Added
+- **Detached MTP draft ingestion (BMOE-SPEC-06).** `bmoe-server` and `bmoe-cli` accept
+  `--model-draft FILE` / `-md` to load the trained NextN head from its own gguf (the
+  unsloth/AtomicChat `mtp-*.gguf` sidecars for Qwen3.8-Flash-Next) instead of
+  self-speculating over the base model's nextn block. `-ngld N` / `--n-gpu-layers-draft`
+  offloads the head independently of the target's expert budget (keeping a small sidecar off
+  the WDDM paging path when the base already fills VRAM), and `--spec-type`
+  `draft-mtp|draft` selects the NextN-head driver or a standalone autoregressive draft
+  model (vocab-checked against the target). The head borrows the target's embeddings/lm
+  head when the export marks `nextn_shared_target_tensors`; the hidden width is validated
+  with a descriptive runtime error instead of a GGML_ASSERT. The streamer resolves the
+  head's `blk.<n_layer>.nextn` expert offsets from the head file (appended as an extra
+  shard), so the MTP block's experts stream like any other layer's.
+- **Qwen3.8-Flash-Next recurrent state rollback (port of upstream PR #28123).** The
+  recurrent cache's convolution snapshot is now written per rollback slot, each ending one
+  token earlier, so a rejected draft rolls the target's conv/DeltaNet state back by exactly
+  the number of rejected tokens via `n_rs_seq` snapshots -- no `SEQ_RM_TYPE_FULL` host
+  serialization of the whole recurrent state on every turn. This restores the full-rate
+  speculative path (measured clean on Flash-Next with the detached head).
+- **Draft-only GGUF export support (fork `65114df17`).** A MTP head gguf that declares the
+  full block count but ships only the `blk.48` block now loads: the trunk tensors are
+  marked `TENSOR_NOT_REQUIRED` when `blk.0.hc_attn_norm.weight` is absent, and both the
+  `nextn.hc_head_*` (current exports) and `nextn.shared_head_*` (older exports) mixer names
+  are accepted.
+
+### Fixed
+- **`sched_reserve` NULL-buffer assert under `op_offload=true` (fork `d034a0aa2`).** The
+  BMOE-SCHED-01 weight-pin guard read the host check against the raw `src->buffer`, which is
+  NULL for view-backed weights, so `ggml_backend_buffer_is_host(NULL)` asserted during graph
+  reserve for qwen4exp. Resolves through `wbuf` (view-aware) instead; the dense Flash-Next
+  path at `-ngl 0` now reserves and runs.
+- **Unmasked MTP export volume assert (same fork commit).** The trunk's last-layer
+  output-row gather ran unconditionally; with an unmasked `embeddings_nextn` export (every
+  token's hidden row is needed for the multi-token verify batch) the tensor was already
+  collapsed to `n_outputs` and the export reshape demanded `n_tokens` rows. The gather now
+  defers until after the `t_h_nextn` export, matching the reference implementation.
+
+### Changed
+- **Engine version 0.28.0.** `project(VERSION)` bumped from 0.27.4.
+- Submodule pinned to `OllyJohnston/llama.cpp` `bmoe/expert-ready-hook` `d034a0aa2` (was
+  `5d00e641`); see `docs/seam.md`.
+
 ## [0.27.4] - 2026-09-05
 
 ### Changed

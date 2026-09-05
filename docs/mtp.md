@@ -225,6 +225,32 @@ streamed device: **the MTP block carries its own MoE FFN**, so every skipped pos
 that no longer happens and a set of expert slices that no longer has to be read. At draft 3 with
 acceptance around 60%, roughly one position per group stops being computed and streamed.
 
+## Detached MTP heads (`--model-draft`)
+
+Not every MTP export ships the head in the base file. Qwen3.8-Flash-Next is the current example:
+the base shards split the model without the nextn block, and the trained head travels as a separate
+`mtp-*.gguf` sidecar (`nextn_shared_target_tensors = true` — it borrows the target's `token_embd` /
+`output` rather than carrying its own). `--model-draft FILE` loads that head; the base gguf then
+carries no `nextn_predict_layers`, so `-md` is what tells the engine where the nextn block is.
+
+- **`--model-draft FILE` / `-md`** — the MTP source's model. With it, `Session::open` loads the head
+  into a second `llama_model` (`model_shared = target` so a `-shared` export's missing embeddings/lm
+  head resolve against the base; a self-contained head just carries its own), validates the hidden
+  width against the target with a descriptive error, and creates the MTP draft context over the
+  head with `ctx_other = target`. The streamer appends the head file as an extra shard, so the
+  MTP block's own `blk.<n_layer>.nextn` experts are read by the same lane machinery as the trunk's.
+- **`--n-gpu-layers-draft N` / `-ngld`** — the head's own offload count (`-1` inherits the target's).
+  A small head must not piggyback the target's expert budget: with the base already filling VRAM,
+  the head defaults stay near-memory and off the WDDM paging path.
+- **`--spec-type draft-mtp|draft`** — `draft-mtp` (default with `-md`) drives the trained NextN
+  head; `draft` instead treats the file as a standalone autoregressive draft model (a small full
+  model, vocab-checked against the target, greedy candidates, no borrow).
+
+A draft-only export declares the full block count but ships only the MTP block; the fork now probes
+`blk.0` and marks the absent trunk `TENSOR_NOT_REQUIRED`. Rollback works exactly as above: the
+target's recurrent state rolls back by the rejected count through `n_rs_seq` snapshots — verified
+zero `SEQ_RM_TYPE_FULL` host serializations in a live Flash-Next run with a 50%-rejection stream.
+
 ## Compact Rollback (`--spec-mtp-cr-depth`)
 
 The native rollback above is a **snapshot table**: the target context keeps `n_rs_seq` recurrent-state
