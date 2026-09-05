@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.27.4] - 2026-09-05
+
+### Changed
+- **Engine version 0.27.4.** `project(VERSION)` bumped from 0.27.3.
+- **Pinned layers 0..n_pinned-1 run native CUDA again under `--cpu-moe` (BMOE-SCHED-01).**
+  During the hybrid static-offload work the pinned layers were forcibly moved to the CPU buffer
+  type (a safe but slow path taken while diagnosing a device/host dispatch fault). With the
+  scheduler guard shipped in this release, the CPU override for `0..n_pinned-1` is reverted:
+  those layers once again bind to the CUDA0 device buft at `-ngl n>0` and their MoE nodes
+  dispatch to the GPU, restoring decode throughput to the 50-56 tok/s bracket on the 35B-A3B
+  reference profile (was ~5 tok/s on the faulting intermediate). Layers `n_pinned..255` keep the
+  plain-CPU override and stream their experts from host. No behavioural change at `-ngl 0` or
+  with `--n-pinned-layers 0`.
+
+### Fixed
+- **CPU MoE decode could dereference a CUDA device pointer and fault the worker.**
+  With pinned layers on the device buft plus `op_offload=false`, upstream's scheduler weights
+  rule only fired when `src->buffer != NULL` — view-backed weight slices slipped past it, and
+  pass 3's "most supported inputs" fallback assigned the op to the CPU backend even though its
+  weight lives in a CUDA buffer. The CPU OpenMP worker then read the device pointer as host
+  memory (a `movzx` quant-block row load, `0xC0000005` before the first token). Fork guard
+  `ggml_backend_sched_backend_id_from_cur` (the only scheduler change, no pass-3 edits): the
+  weight buffer is now resolved through `view_src`, and when no backend supports both the op
+  and the buffer type (e.g. the fused MoE kernel rejects the combination) the op is pinned via
+  `SET_CAUSE("1.pin")` to the backend that owns the buffer type, so the graph executes the
+  unfused kernel there. CPU workers can never see a device tensor. Submodule pinned to fork
+  `5d00e641` (see `docs/seam.md`); the guard is a 16-line delta against upstream.
+- **Pinned layers could arm the dual-stream VRAM staging path.** `set_pinned_layers` ran
+  inside the staging-eligibility scan, so the check for a pinned layer's device buffer used a
+  stale (zero) mask on the first pass. The mask is now applied before the scan and pinned
+  layers are skipped by `is_layer_pinned`, so their device buffers can never trigger the
+  VRAM-arena streaming setup.
+
 ## [0.27.3] - 2026-09-05
 
 ### Fixed

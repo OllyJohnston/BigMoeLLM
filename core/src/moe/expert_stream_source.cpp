@@ -130,8 +130,35 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
 #if defined(BMOE_HAVE_CUDA)
     cuda_staging_enabled_ = false;
     host_pinned_ = false;
-    for (const LayerExperts & L : layers_) {
+    // BMOE-SCHED-01: "pinned layers" only means something when they sit in a non-host (device)
+    // buffer. In a host-only deployment (-ngl 0, the gates) no layer is device-resident, so
+    // arming the mask would wrongly exempt every layer from streaming AND speculation. Probe the
+    // first n_pinned_layers for a real device buffer; arm the mask only when one exists, then
+    // skip those layers in the scan below so their device buffers never arm the VRAM-arena
+    // staging path for the streamed layers.
+    const int n_pin = cfg.n_pinned_layers > (int) layers_.size() ? (int) layers_.size() : cfg.n_pinned_layers;
+    bool pinned_device_resident = false;
+    if (n_pin > 0) {
+        for (int il = 0; il < n_pin; ++il) {
+            const LayerExperts & L = layers_[il];
+            if (!L.bound) continue;
+            for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                if (!L.proj[p].tensor || !L.proj[p].tensor->buffer) continue;
+                if (!ggml_backend_buffer_is_host(L.proj[p].tensor->buffer)) {
+                    pinned_device_resident = true;
+                    break;
+                }
+            }
+            if (pinned_device_resident) break;
+        }
+    }
+    if (pinned_device_resident) {
+        cuda_stager_.set_pinned_layers(n_pin);
+    }
+    for (int il = 0; il < (int) layers_.size(); ++il) {
+        const LayerExperts & L = layers_[il];
         if (!L.bound) continue;
+        if (cuda_stager_.is_layer_pinned(il)) continue;
         for (int p = 0; p < MoeRecipe::max_exps; ++p) {
             if (!L.proj[p].tensor || !L.proj[p].tensor->buffer) continue;
             if (!ggml_backend_buffer_is_host(L.proj[p].tensor->buffer)) {
@@ -171,10 +198,6 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         cuda_stager_.init(arena_sz, n_slots);
         std::fprintf(stderr, "bmoe: dual-stream CUDA VRAM staging enabled (%zu MiB arena, %d slots of %zu MiB)\n",
                      arena_sz / (1024 * 1024), n_slots, slot_cap / (1024 * 1024));
-
-        if (cfg.n_pinned_layers > 0) {
-            cuda_stager_.set_pinned_layers(cfg.n_pinned_layers);
-        }
     }
 #endif
 
@@ -1133,10 +1156,13 @@ bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, in
 // ── load: stage routed experts, read the batch, evict cold entries to budget ────────
 bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
     if (!active_ || il < 0 || il >= n_layer_ || !layers_[il].bound || !ids || n_ids <= 0) return false;
-#if defined(BMOE_HAVE_CUDA)
-    if (cuda_staging_enabled_ && cuda_stager_.is_layer_pinned(il)) return true;
-#endif
+    // Overlap first: load_layer_async owns the pinned-layer readiness publish. The serial path
+    // below can early-return for pinned layers (no reads needed - already resident), but in
+    // overlap mode the graph hook waits on readiness flags, so the async path must publish them.
     if (overlap_) return load_layer_async(il, ids, n_ids);
+#if defined(BMOE_HAVE_CUDA)
+    if (cuda_stager_.is_layer_pinned(il)) return true;
+#endif
     LayerExperts & L = layers_[il];
     cgen_++;
 
@@ -1286,8 +1312,33 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
 // order it blocks on them, minimising stalls. Correctness does not depend on the order — the
 // readiness flags gate each expert regardless — only latency does.
 bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids) {
+    if (!active_ || il < 0 || il >= n_layer_ || !layers_[il].bound || !ids || n_ids <= 0) return false;
 #if defined(BMOE_HAVE_CUDA)
-    if (cuda_staging_enabled_ && cuda_stager_.is_layer_pinned(il)) return true;
+    if (cuda_stager_.is_layer_pinned(il)) {
+        // Pinned by config: the weights are already resident (GPU-resident for the device path,
+        // CPU-mapped for the all-CPU fallback), so there is nothing to read - but the overlap
+        // hook still waits on this layer's readiness flags, and the graph compute fails if a
+        // waiter never resolves. Publish readiness immediately for every requested expert, then
+        // return. This trades one fetch_add + per-expert flag stores for the entire staging path.
+        const uint32_t gen = async_gen_.fetch_add(1, std::memory_order_relaxed) + 1;
+        cur_il_.store(il, std::memory_order_relaxed);
+        std::fill(seen_.begin(), seen_.end(), (uint8_t) 0);
+        for (int i = 0; i < n_ids; ++i) {
+            const int e = load_all_ ? (i < n_expert_ ? i : -1) : ids[i];
+            if (e < 0 || e >= n_expert_ || seen_[e]) continue;
+            seen_[e] = 1;
+            for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                const uint64_t slice = layers_[il].proj[p].nb2;
+                if (slice == 0) continue; // absent slot in a fused layout
+                ready_[(size_t) p * (size_t) n_expert_ + (size_t) e].gen.store(gen, std::memory_order_release);
+            }
+        }
+        if (ready_waiters_.load(std::memory_order_seq_cst) != 0) {
+            std::lock_guard<std::mutex> lk(ready_mtx_);
+            ready_cv_.notify_all();
+        }
+        return true;
+    }
 #endif
     LayerExperts & L = layers_[il];
 

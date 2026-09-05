@@ -643,15 +643,15 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             // mmaps them); no_host prevents the loader's CPU-override from being rerouted onto a
             // driver-pinned CUDA_Host buffer, keeping them on plain CPU buft (see below).
             if (cfg.moe.cpu_moe) {
-                // --cpu-moe: expert weights execute on the CPU backend (op_offload = false), so
-                // layering them on a cudaMallocHost pin (CUDA_Host) is wrong on two counts: it
-                // commits ~3.7 GB of driver-pinned host RAM for no benefit, and — worse — the
-                // model loader rewrites the CPU override to the pinned buffer while the layers
-                // 0..n_pinned-1 (not covered by any override) stay on the CUDA0 device buft. The
-                // CPU compute then dereferences a device pointer as host memory, which faults the
-                // worker with an access violation before the first token. Forcing no_host makes
-                // every "override to CPU" resolve to the plain CPU buft, so the entire MoE stack
-                // executes host-resident and the device/host split never occurs.
+                // --cpu-moe hybrid (BMOE-SCHED-01): layers 0..n_pinned-1 stay on the CUDA0 device
+                // buft (no override), so their MoE nodes dispatch to CUDA and decode keeps GPU
+                // throughput; layers n_pinned..255 override to the plain CPU buft and stream from
+                // host. no_host prevents the loader from rerouting the CPU override onto a
+                // cudaMallocHost (CUDA_Host) pin — that committed ~3.7 GB of driver-pinned host
+                // RAM for no benefit and, pre-guard, let the CPU compute path dereference a
+                // device pointer as host memory (movzx AV in an OpenMP worker). The scheduler
+                // guard in ggml-backend.cpp pins any op whose weight lives in a non-host buffer
+                // to the owning backend, so a CPU worker can never see a device tensor.
                 mparams.no_host = true;
             }
             ggml_backend_buffer_type_t target_buft = cfg.moe.cpu_moe ? ggml_backend_cpu_buffer_type() :
@@ -660,18 +660,6 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
 #else
                 ggml_backend_cpu_buffer_type();
 #endif
-            if (cfg.moe.cpu_moe) {
-                // Option 2 (safe CPU path): resolve the pinned layers 0..n_pinned-1 to a plain
-                // CPU buffer as well, so the whole MoE stack computes host-resident. The loader
-                // normally places them on the CUDA0 device buft (since -ngl n>0 assigns every
-                // layer to the GPU); with op_offload=false the CPU backend then dereferences a
-                // device pointer as host memory and the decode faults before the first token.
-                // Their tensors are kept resident by the streamer's is_layer_pinned() skip — the
-                // "pin" is now a guarantee to never evict them, not a VRAM residency claim.
-                for (int il = 0; il < n_pinned; ++il) {
-                    buft_override_patterns.push_back("blk\\." + std::to_string(il) + "\\.ffn_.*exps.*");
-                }
-            }
             for (int il = n_pinned; il < 256; ++il) {
                 buft_override_patterns.push_back("blk\\." + std::to_string(il) + "\\.ffn_.*exps.*");
             }
