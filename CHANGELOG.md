@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.29.0] - 2026-09-06
+
+### Added
+- **Upstream sync: fast MoE multi-expert GEMM dispatch (PR #27978).** Cherry-picked
+  `mm_ids_helper`'s power-of-two lane padding generalisation onto the switched
+  `mmid.cu` path so any `n_expert_used` (not just 6/16/32) reaches the grouped fast
+  path. `n_expert_used = 10` (Qwen3.8-Flash-Next's routed expert count) now dispatches
+  to `case 10` instead of the generic per-token warp-reduction path. Upstream measured
+  2334 → 2600 t/s prompt processing on Flash-Next at 55k context; token generation is
+  unaffected (single-token batches already took the fast path).
+
+### Fixed
+- **Guard the Hadamard `k_rot` copy against an unassigned buffer (PR #27967).**
+  Cherry-picked the `k_rot && k_rot->buffer` check in the KV-cache context-shift path,
+  preventing a crash when shifting sequences with an unquantized K cache (`-ctk f32`)
+  that never materialised a `k_rot` buffer.
+
 ## [0.28.0] - 2026-09-05
 
 ### Added
