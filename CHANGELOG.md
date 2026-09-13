@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.30.0] - 2026-09-13
+
+### Added
+- **Block-granular adaptive KV streaming (`--kv-stream-stage-mib N`, engine 0.30.0).**
+  Transplanted the upstream adaptive-kv-streaming implementation (RaymondHuang210129,
+  commit `bd20cb57`) onto `bmoe/expert-ready-hook` (`2f598a90`), strictly gated to
+  `qwen35` dense models. The KV cache no longer needs to fit in VRAM: K/V pages stream
+  through a host pool (`cudaHostAllocMapped`, no WriteCombined - preserving the upstream
+  WDDM fix) into a small `cudaMalloc` device ring, prefetched cross-layer on a dedicated
+  copy stream inside the CUDA graph. Qwen3.8-27B at `-c 131072` decodes at **30.5 tok/s**
+  through `CUDA_KV_Stream_Host` staging versus ~8 tok/s unstreamed, with VRAM averaging
+  11.2 GB / peaking 15.5 GB on the 16 GB RTX 5070 Ti and zero WDDM shared-memory paging
+  (no TDR events). MoE paths are untouched: Qwen3.8-Flash-Next (`qwen4exp`) bypasses
+  streaming entirely and its zero-split CUDA graph capture is verified intact
+  (`--cpu-moe` + detached MTP both green). MTP/draft contexts never instantiate a
+  streaming ring (`kv_stream_stage_mib` zeroed for them).
+
 ## [0.29.0] - 2026-09-06
 
 ### Added

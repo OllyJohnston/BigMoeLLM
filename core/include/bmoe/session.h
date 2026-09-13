@@ -43,6 +43,7 @@ struct SessionConfig {
     std::string cache_type_v = "f16";
     bool flash_attn = true;
     bool no_kv_offload = false; // keep KV cache in host system RAM (-nkqv, --no-offload-kqv, --no-kv-offload)
+    uint32_t kv_stream_stage_mib = 0; // block-granular KV streaming staging pool in MiB (0 = disabled; Qwen3.5 dense only)
 
 
     // Widest graph actually computed at once. 0 = follow n_batch. Sizing this down trades prefill

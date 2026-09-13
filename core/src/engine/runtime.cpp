@@ -26,6 +26,7 @@ SessionConfig session_config_from(const RunConfig & cfg) {
     sc.cache_type_v = cfg.cache_type_v;
     sc.flash_attn = cfg.flash_attn;
     sc.no_kv_offload = cfg.no_kv_offload;
+    sc.kv_stream_stage_mib = cfg.kv_stream_stage_mib;
     return sc;
 }
 

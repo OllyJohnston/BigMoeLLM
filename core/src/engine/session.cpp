@@ -831,6 +831,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
                                : (uint32_t) cfg.spec.draft_max;
     }
     cparams.offload_kqv = !cfg.no_kv_offload;
+    cparams.kv_stream_stage_mib = cfg.kv_stream_stage_mib;
 
 #if defined(BMOE_HAVE_CUDA)
     cparams.op_offload = !cfg.moe.cpu_moe;
@@ -874,6 +875,9 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         llama_context_params dparams = cparams;
         dparams.ctx_type = simple_draft ? LLAMA_CONTEXT_TYPE_DEFAULT : LLAMA_CONTEXT_TYPE_MTP;
         dparams.n_rs_seq = 0;
+        // KV streaming is target-context only: the draft reads states already resident on the
+        // target, so it must never instantiate a streaming ring of its own.
+        dparams.kv_stream_stage_mib = 0;
         // A detached MTP head is a second model riding on the target's states: the MTP graph reads
         // h_nextn from the target's memory, so point the draft context at the target context.
         // Self-speculation leaves it null — one model, two contexts, and llama.cpp already wires

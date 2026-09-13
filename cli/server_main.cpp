@@ -846,6 +846,7 @@ static void print_usage(const char * argv0) {
                 "\n"
                 "  All bmoe-cli streaming and decoding flags are supported:\n"
                 "  -t, --threads, -ngl, --n-gpu-layers, -nkqv, --no-offload-kqv, -c, --ctx-size\n"
+  "  --kv-stream-stage-mib N  block-granular KV streaming staging pool in MiB (0 = disabled; Qwen3.5 dense only)\n"
                 "  --ubatch, --batch-size, --moe-stream, --cache-mb, --cache-floor-mb, --cache-ceil-mb,\n"
                 "  --io-threads, --no-odirect, --dense-weights,\n"
                 "  --prefetch, --predict-prefetch, --drop-cold-experts,\n"
@@ -1019,6 +1020,10 @@ int main(int argc, char ** argv) {
             cfg.cache_type_k = next("-ctk");
         else if (a == "-ctv" || a == "--cache-type-v")
             cfg.cache_type_v = next("-ctv");
+        else if (a == "--kv-stream-stage-mib") {
+            const int v = std::atoi(next("--kv-stream-stage-mib"));
+            cfg.kv_stream_stage_mib = v > 0 ? (uint32_t) v : 0;
+        }
         else if (a == "-fa" || a == "--flash-attn")
             cfg.flash_attn = true;
         else if (a == "--no-flash-attn" || a == "--no-fa")
