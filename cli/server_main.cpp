@@ -847,6 +847,7 @@ static void print_usage(const char * argv0) {
                 "  All bmoe-cli streaming and decoding flags are supported:\n"
                 "  -t, --threads, -ngl, --n-gpu-layers, -nkqv, --no-offload-kqv, -c, --ctx-size\n"
   "  --kv-stream-stage-mib N  block-granular KV streaming staging pool in MiB (0 = disabled; Qwen3.5 dense only)\n"
+  "  --cuda-nvfp4 MODE       native Blackwell NVFP4 MMA: auto (default; dense Qwen3.5 + sm_120 only), on, off\n"
                 "  --ubatch, --batch-size, --moe-stream, --cache-mb, --cache-floor-mb, --cache-ceil-mb,\n"
                 "  --io-threads, --no-odirect, --dense-weights,\n"
                 "  --prefetch, --predict-prefetch, --drop-cold-experts,\n"
@@ -1023,6 +1024,20 @@ int main(int argc, char ** argv) {
         else if (a == "--kv-stream-stage-mib") {
             const int v = std::atoi(next("--kv-stream-stage-mib"));
             cfg.kv_stream_stage_mib = v > 0 ? (uint32_t) v : 0;
+        }
+        else if (a == "--cuda-nvfp4") {
+            const char * v = next("--cuda-nvfp4");
+            if (strcmp(v, "on") == 0) {
+                cfg.cuda_nvfp4 = RunConfig::Nvfp4Mode::on;
+            } else if (strcmp(v, "off") == 0) {
+                cfg.cuda_nvfp4 = RunConfig::Nvfp4Mode::off;
+            } else if (strcmp(v, "auto") == 0) {
+                cfg.cuda_nvfp4 = RunConfig::Nvfp4Mode::auto_;
+            } else {
+                fprintf(stderr, "bmoe: invalid --cuda-nvfp4 value '%s' (expected auto|on|off)\n", v);
+                print_usage(argv[0]);
+                return 2;
+            }
         }
         else if (a == "-fa" || a == "--flash-attn")
             cfg.flash_attn = true;

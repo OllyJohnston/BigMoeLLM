@@ -366,6 +366,14 @@ struct RunConfig {
     bool no_kv_offload = false;       // keep KV cache in host system RAM (-nkqv, --no-offload-kqv, --no-kv-offload)
     uint32_t kv_stream_stage_mib = 0; // block-granular KV streaming staging pool in MiB (0 = disabled; Qwen3.5 dense only)
 
+    // Native Blackwell NVFP4 acceleration. auto (default) enables only when the model is a dense
+    // Qwen3.5 (LLM_ARCH_QWEN35) and the GPU is Blackwell sm_120+; on explicitly requests it and
+    // warns + falls back when the architecture is not dense; off forces the standard GGUF types
+    // to execute as-is and never runs the native NVFP4 MMA path.
+    enum class Nvfp4Mode { off = 0, auto_ = 1, on = 2 };
+
+    Nvfp4Mode cuda_nvfp4 = Nvfp4Mode::auto_;
+
 
 
     // Largest batch computed in one graph, i.e. the prefill chunk size. 0 (the default) means

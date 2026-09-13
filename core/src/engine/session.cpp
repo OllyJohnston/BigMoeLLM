@@ -833,6 +833,52 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     cparams.offload_kqv = !cfg.no_kv_offload;
     cparams.kv_stream_stage_mib = cfg.kv_stream_stage_mib;
 
+    // Native Blackwell NVFP4 acceleration gate. The CUDA kernels dispatch NVFP4 tensors to the
+    // native E2M1 MMA only when the device is sm_120+; this run-level switch decides whether that
+    // path is authorized for the loaded model. Dense Qwen3.5 is the only sanctioned target: the
+    // Flash-Next hybrid streams expert weights and its QSA-gather attention, and routing NVFP4
+    // expert tensors through the fused MoE path there is not qualified. auto (= default) enables
+    // exactly when the model is dense Qwen3.5 and the device is Blackwell; explicit on warns and
+    // falls back to off for any other architecture; off never authorizes the native path. The
+    // resolved decision is only reported here: the llama.cpp kernel path itself is what actually
+    // executes the MMA, and it is keyed on the tensor type plus the device capability, never on
+    // this mode. Changing it cannot alter graph construction, so the zero-split invariant holds.
+    if (cfg.cuda_nvfp4 != RunConfig::Nvfp4Mode::off) {
+        const bool is_dense_target = (im.arch == "qwen35");
+        int cc_major = 0;
+        int cc_minor = 0;
+#if defined(BMOE_HAVE_CUDA)
+        cudaError_t e_maj = cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, 0);
+        cudaError_t e_min = cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, 0);
+        if (e_maj != cudaSuccess || e_min != cudaSuccess) {
+            cc_major = cc_minor = 0;
+        }
+#endif
+        const int cc_major100 = cc_major * 100;
+        const int cc = cc_major100 + cc_minor * 10;
+        const bool is_sm120 = (cc >= 1200);
+        const bool authorized = is_dense_target && is_sm120;
+
+        bool resolved_on = false;
+        if (cfg.cuda_nvfp4 == RunConfig::Nvfp4Mode::on) {
+            if (!authorized) {
+                std::fprintf(stderr,
+                             "bmoe: warning: NVFP4 requested but model architecture '%s' is not a dense "
+                             "Qwen3.5 (or device cc %d is not Blackwell); forcing NVFP4 OFF to protect the MoE pipeline\n",
+                             im.arch.c_str(), cc);
+                resolved_on = false;
+            } else {
+                resolved_on = true;
+            }
+        } else { // auto_
+            resolved_on = authorized;
+        }
+        std::fprintf(stderr, "Blackwell NVFP4 acceleration: %s (arch: %s, cc: %d)\n",
+                     resolved_on ? "ENABLED" : "DISABLED", im.arch.c_str(), cc / 10);
+    } else {
+        std::fprintf(stderr, "Blackwell NVFP4 acceleration: OFF (requested)\n");
+    }
+
 #if defined(BMOE_HAVE_CUDA)
     cparams.op_offload = !cfg.moe.cpu_moe;
 #endif
@@ -878,6 +924,11 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         // KV streaming is target-context only: the draft reads states already resident on the
         // target, so it must never instantiate a streaming ring of its own.
         dparams.kv_stream_stage_mib = 0;
+        // The draft context never runs the native NVFP4 MMA path: it exists only to suggest
+        // continuations, and its graph is kept minimal and capture-stable. The CUDA kernels key
+        // the MMA selection on the tensor type plus device capability; the draft's graph borrows
+        // only the head tensors from the target model, so even a target carrying NVFP4 weights
+        // never routes them through a draft graph. No per-context flag exists, so nothing to zero.
         // A detached MTP head is a second model riding on the target's states: the MTP graph reads
         // h_nextn from the target's memory, so point the draft context at the target context.
         // Self-speculation leaves it null — one model, two contexts, and llama.cpp already wires

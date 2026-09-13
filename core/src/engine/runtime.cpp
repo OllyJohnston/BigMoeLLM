@@ -27,6 +27,7 @@ SessionConfig session_config_from(const RunConfig & cfg) {
     sc.flash_attn = cfg.flash_attn;
     sc.no_kv_offload = cfg.no_kv_offload;
     sc.kv_stream_stage_mib = cfg.kv_stream_stage_mib;
+    sc.cuda_nvfp4 = cfg.cuda_nvfp4;
     return sc;
 }
 

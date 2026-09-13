@@ -45,6 +45,10 @@ struct SessionConfig {
     bool no_kv_offload = false; // keep KV cache in host system RAM (-nkqv, --no-offload-kqv, --no-kv-offload)
     uint32_t kv_stream_stage_mib = 0; // block-granular KV streaming staging pool in MiB (0 = disabled; Qwen3.5 dense only)
 
+    // Native Blackwell NVFP4 acceleration mode (see RunConfig::Nvfp4Mode). The engine resolves it
+    // to a decision in Session::open once the architecture and device compute capability are known.
+    RunConfig::Nvfp4Mode cuda_nvfp4 = RunConfig::Nvfp4Mode::auto_;
+
 
     // Widest graph actually computed at once. 0 = follow n_batch. Sizing this down trades prefill
     // throughput for resident compute buffers, which on this engine compete with the expert cache.

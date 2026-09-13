@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.31.0] - 2026-09-13
+
+### Added
+- **Native Blackwell NVFP4 acceleration switch (`--cuda-nvfp4 auto|on|off`).**
+  Exposes the fork's existing native E2M1 MMA path (keyed on the NVFP4 tensor type plus an
+  sm_120+ device) behind an explicit engine decision. `auto` (default) authorizes the native
+  path only when the model is a dense Qwen3.5 (`LLM_ARCH_QWEN35`) and the device reports
+  compute capability 12.0+; `on` requests it and warns then falls back for any other
+  architecture; `off` never authorizes it. The resolution is logged verbatim
+  (`Blackwell NVFP4 acceleration: ENABLED/DISABLED (arch: ..., cc: ...)`) and is inert with
+  respect to graph construction: it changes no scheduler or buffer assignment, so the
+  zero-split CUDA graph capture invariant for the Flash-Next streamer is preserved
+  (gate-proven, split counts bit-identical with and without the flag). The draft/MTP context
+  is documented as never routing NVFP4 tensors (its graph borrows only head tensors). Added to
+  both `bmoe-cli` and `bmoe-server` usage and parsing.
+
+### Verified
+- **Gate A (Flash-Next 51B + detached MTP head)**: `--cuda-nvfp4 auto` logs
+  `DISABLED (arch: qwen4exp, cc: 120)`, warns + falls back on explicit `on`, exit 0, MTP
+  acceptance intact.
+- **Gate B (dense Qwen3.8-27B APEX)**: standard GGUF runs unmodified, exit 0, ~570 tok/s.
+- **Gate C (Qwen3.8-27B NVFP4 MID-HIGH, esatapedico)**: 448 NVFP4 tensors load natively,
+  logs `ENABLED (arch: qwen35, cc: 120)`, 357-544 tok/s decode, coherent output, exit 0.
+  Peak resident VRAM 15 888 MiB of 16 302 (the MID-HIGH tier carries Q8_0 extras on top of
+  the NVFP4 backbone; a LOW-tier container would be substantially smaller), zero WDDM shared
+  spill, zero nvlddmkm TDR events.
+
 ## [0.30.0] - 2026-09-13
 
 ### Added

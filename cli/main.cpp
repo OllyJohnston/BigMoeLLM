@@ -366,6 +366,7 @@ static void print_usage(const char * argv0) {
         "  -ngl, --n-gpu-layers N  number of layers to offload to GPU (default 0)\n"
         "  -nkqv, --no-offload-kqv disable KV cache offloading to GPU (keep KV in system RAM)\n"
   "  --kv-stream-stage-mib N  block-granular KV streaming staging pool in MiB (0 = disabled; Qwen3.5 dense only)\n"
+  "  --cuda-nvfp4 MODE       native Blackwell NVFP4 MMA: auto (default; dense Qwen3.5 + sm_120 only), on, off\n"
         "  -c, --ctx-size N        context size (default 2048)\n"
         "\n"
         "      --ubatch N          widest graph computed at once (0 = as wide as the context).\n"
@@ -692,6 +693,20 @@ int main(int argc, char ** argv) {
         else if (a == "--kv-stream-stage-mib") {
             const int v = std::atoi(next("--kv-stream-stage-mib"));
             cfg.kv_stream_stage_mib = v > 0 ? (uint32_t) v : 0;
+        }
+        else if (a == "--cuda-nvfp4") {
+            const char * v = next("--cuda-nvfp4");
+            if (strcmp(v, "on") == 0) {
+                cfg.cuda_nvfp4 = RunConfig::Nvfp4Mode::on;
+            } else if (strcmp(v, "off") == 0) {
+                cfg.cuda_nvfp4 = RunConfig::Nvfp4Mode::off;
+            } else if (strcmp(v, "auto") == 0) {
+                cfg.cuda_nvfp4 = RunConfig::Nvfp4Mode::auto_;
+            } else {
+                fprintf(stderr, "bmoe: invalid --cuda-nvfp4 value '%s' (expected auto|on|off)\n", v);
+                print_usage(argv[0]);
+                return 2;
+            }
         }
         else if (a == "--chatml")
             cfg.chatml = true;
