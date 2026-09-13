@@ -104,6 +104,11 @@ public:
     // hook was not compiled in. Paired with shutdown(), which unregisters it.
     void enable_overlap_hook();
 
+    // Restrict the two-wave projection stagger (up+gate before down) to this architecture.
+    // Call once before init; the engine passes the recipe arch it resolved. Empty (unknown)
+    // keeps the historical single-first-projection wave for every arch.
+    void set_stagger_arch(const char * arch) { stagger_arch_ = arch ? arch : ""; }
+
     // True once an async read has failed or the source is shutting down. Wired to
     // llama_set_abort_callback so a mid-decode I/O failure aborts the graph cleanly
     // instead of computing on a half-read expert.
@@ -203,9 +208,10 @@ private:
     // LRU mode only (cache_max_ > 0) — the shared-slot path has no entries to account for.
     // `promote` = false skips the hit-path LRU move for callers that re-order every touched id
     // afterwards anyway (the overlap path's token-major promote loop); a miss is always linked.
-    // `commit_only_proj` >= 0 commits only that projection's pages on a miss (two-wave publish:
-    // the caller contracts to commit the rest via commit_proj_pages before emitting their jobs).
-    bool touch_entry(int il, int e, bool & hit, bool promote = true, int commit_only_proj = -1);
+    // `commit_mask` selects which projections' pages are committed on a miss. -1 commits all;
+    // a bitmask (1 << p) commits only the listed slots (two-wave publish: the caller contracts
+    // to commit the rest via commit_proj_pages before emitting their jobs). Bit 31 is unused.
+    bool touch_entry(int il, int e, bool & hit, bool promote = true, int commit_mask = -1);
 
     // Commit the pages of one (layer, expert, projection) cache slice so a read can land in it.
     bool commit_proj_pages(int il, int e, int p);
@@ -227,6 +233,7 @@ private:
     bool load_all_ = false;
     bool overlap_ = false;
     bool two_wave_ = false;                  // publish the first projection's jobs before committing the rest (#118)
+    std::string stagger_arch_;               // arch restricted to the up+gate stage stagger ("" = off)
     bool prefetch_sync_ = false;             // test only: drain prefetch reads synchronously (serial mode)
     bool spec_adopt_ = false;                // route-ahead: staged layers adopt committed spec reads (see quiesce_spec)
     std::vector<int32_t> spec_adopt_ids_;    // scratch: the loading layer's pending spec entries

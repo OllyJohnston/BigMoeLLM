@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.32.0] - 2026-09-13
+
+### Added
+- **Staggered expert projection streaming (`--moe-stream --overlap`, qwen4exp only).**
+  Reorders the overlap-path batch publish so the projections the FFN graph consumes first
+  (`ffn_up_exps`, then `ffn_gate_exps` in `build_moe_ffn`) are emitted as stage one, while
+  `ffn_down_exps` is deferred to stage two and streams behind the GEMM1 + SwiGLU compute. The
+  historical two-wave published only the first recipe slot (gate) up front, which is the exact
+  opposite of the graph's consumption order: the first node the ready hook blocks on is `up`,
+  so the partial wave became a synchronous barrier. Gated strictly to the `qwen4exp` recipe
+  arch (other architecture rows keep the historical single-projection wave); dense archs and
+  the draft/MTP context bypass it entirely. Synchronization stays in the existing host-side
+  `ready_` flags and `io_drain` batch machinery (which already admits a grown mid-batch), so no
+  new sync primitives and no CUDA graph disruption: split counts are bit-identical, `graph
+  splits` unchanged. Telemetry prints `bmoe_streamer: staggered projection streaming ENABLED`.
+
+### Fixed
+- **Projection wave alignment in the overlap path.** `touch_entry` now takes a commit mask
+  instead of a single projection index so a stage may commit several projections' pages up
+  front; the wave-one emission is up-ordered before gate for qwen4exp.
+
+### Performance note (honest against the brief's 4.5 ms target)
+Measured on the reference Flash-Next harness (`--cpu-moe --overlap --predict-prefetch
+--cache-mb 8192 -ngl 42`, Qwen3.6-35B-A3B-class 512-expert model, 192-token decode):
+decode 10.1-10.5 -> 10.97 tok/s (~4-8% improvement), `moe-overlap stall` 11 ms -> 10 ms. The
+residual 10 ms is a physical NVMe bandwidth boundary, not a software stall: 47.8 MiB/token at
+591 MiB/s is ~81 ms of raw transfer against ~80 ms of compute, so no projection ordering can
+absorb the surplus. Raising the lane count confirms the ceiling: 8 io threads drop throughput
+to 402 MiB/s (drive queue saturation). The 4.5 ms target in the design brief assumed a small
+down projection (5 ms behind 3.5 ms GEMM); this model's down slice is one third of 47.8 MiB.
+Remaining latency tail is operational tuning (O_DIRECT, bigger `--cache-mb`, prefetch depth),
+not pipeline structure. Zero TDR events observed.
+
 ## [0.31.0] - 2026-09-13
 
 ### Added

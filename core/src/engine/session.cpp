@@ -1107,6 +1107,11 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             im.source.set_dense_tensors(std::move(dense));
         }
 
+        // The projection stagger (up+gate before down) is a qwen4exp property: the FFN graph
+        // consumes up before gate, and dense archs must keep the historical single-projection
+        // wave. Hand the resolved recipe arch to the streamer so it can gate the split.
+        im.source.set_stagger_arch(recipe ? recipe->arch : "");
+
         if (!im.source.init(offs.shard_paths, n_expert, std::move(layers), cfg.moe))
             return fail("expert stream source init failed");
         im.hook->set_source(&im.source);
@@ -1146,6 +1151,12 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
 #else
             return fail("--overlap requires the bmoe llama.cpp fork (expert-ready hook not compiled in)");
 #endif
+            // The projection stagger (up + gate as wave one, down as wave two) arms only for the
+            // qwen4exp arch the gate was resolved for; every other arch keeps the historical wave.
+            if (recipe && recipe->arch && strcmp(recipe->arch, "qwen4exp") == 0) {
+                std::fprintf(stderr, "bmoe_streamer: staggered projection streaming ENABLED (arch: %s)\n",
+                             recipe->arch);
+            }
         }
 
         // The warm-up decode above ran CUDA work; drain it before the clear so the buffer reuse

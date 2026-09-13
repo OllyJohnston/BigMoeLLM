@@ -1117,7 +1117,7 @@ bool ExpertStreamSource::commit_proj_pages(int il, int e, int p) {
     return true;
 }
 
-bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, int commit_only_proj) {
+bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, int commit_mask) {
     const int32_t id = il * n_expert_ + e;
     clookups_++;
     cstamp_[id] = cgen_;
@@ -1137,11 +1137,11 @@ bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, in
     // Miss: commit the pages the caller's reads will fill, then enter the expert as resident. The
     // entry is valid from here on because the caller is contracted to schedule those reads before
     // anything can consume the slices — the barrier that makes this safe is the eval-callback's.
-    // (With commit_only_proj, the caller also contracts to commit the other projections before it
-    // emits their jobs; the residency accounting below still covers the whole entry, because the
-    // entry lives and is evicted as a unit either way.)
+    // (With a commit_mask rather than -1, the caller also contracts to commit the other projections
+    // before it emits their jobs; the residency accounting below still covers the whole entry,
+    // because the entry lives and is evicted as a unit either way.)
     for (int p = 0; p < MoeRecipe::max_exps; ++p) {
-        if (commit_only_proj >= 0 && p != commit_only_proj) continue;
+        if (commit_mask >= 0 && !(commit_mask & (1 << p))) continue;
         if (!commit_proj_pages(il, e, p)) return false;
     }
     if (ever_evicted_[id]) ++rereads_; // this entry was resident once; the cache is buying it again
@@ -1425,13 +1425,39 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
                 if (L.proj[p].nb2) return p;
             return -1;
         }();
-        const bool two_wave = two_wave_ && !load_all_ && p0 >= 0;
+        // Projection stagger (qwen4exp, overlap only): the FFN graph evaluates ffn_moe_up BEFORE
+        // ffn_moe_gate (llama-graph.cpp build_moe_ffn), so the first ready hook block is on up.
+        // The historical two-wave emitted only the first recipe slot (gate) up front, the exact
+        // opposite of the graph's consumption order, so the wave became a synchronous barrier on
+        // the up node. Staged emission instead publishes every non-down projection (up + gate)
+        // as wave one and defers only down to wave two: compute runs GEMM1 + SwiGLU against the
+        // gate/up slices while the down slice transfers behind it. Other architecture rows keep
+        // the historical p0 wave.
+        const bool staggered = !stagger_arch_.empty() && stagger_arch_ == "qwen4exp" && !load_all_ && p0 >= 0;
+        int down_p = -1;
+        if (staggered) {
+            for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                if (!L.proj[p].tensor) continue;
+                const char * name = L.proj[p].tensor->name;
+                if (name && strstr(name, "ffn_down_exps")) {
+                    down_p = p;
+                    break;
+                }
+            }
+        }
+        const bool two_wave = (two_wave_ || staggered) && !load_all_ && p0 >= 0;
+        const int stage_mask = staggered ? [&] {
+            int m = 0;
+            for (int p = 0; p < MoeRecipe::max_exps; ++p)
+                if (L.proj[p].nb2 && p != down_p) m |= 1 << p;
+            return m;
+        }() : (two_wave_ ? (1 << p0) : -1);
         seen_.assign(seen_.size(), 0); // reuse as a per-staged miss marker keyed by expert
         for (int e : staged_) {
             bool hit = false;
             // promote=false: the token-major loop below re-orders every touched id anyway, so a
             // hit-path LRU move here was k wasted pointer operations per layer per token.
-            if (!touch_entry(il, e, hit, /*promote=*/false, two_wave ? p0 : -1)) {
+            if (!touch_entry(il, e, hit, /*promote=*/false, two_wave ? stage_mask : -1)) {
                 // Nothing waits on a flag we will never publish: abort the graph instead.
                 fatal_.store(true, std::memory_order_release);
                 return false;
@@ -1458,8 +1484,27 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
             for (int p = 0; p < MoeRecipe::max_exps; ++p)
                 emit_proj(p);
         } else {
-            // Wave one: the first projection's jobs, published before anything else is committed.
-            emit_proj(p0);
+            // Wave one: the stage-1 projections' jobs, published before anything else is committed.
+            // qwen4exp stagger: every non-down slot, ordered so up precedes gate (the graph
+            // evaluates ffn_moe_up before ffn_moe_gate; the recipe rows them gate-first, which
+            // would reverse the drain order and stall the first node the hook blocks on).
+            // Historical: only the first projection (p0).
+            if (staggered) {
+                for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                    if (!L.proj[p].tensor) continue;
+                    const char * name = L.proj[p].tensor->name;
+                    if (name && strstr(name, "ffn_up_exps")) emit_proj(p);
+                }
+                for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                    if (p == down_p) continue;
+                    if (!L.proj[p].tensor) continue;
+                    const char * name = L.proj[p].tensor->name;
+                    if (name && (strstr(name, "ffn_up_exps") || strstr(name, "ffn_down_exps"))) continue;
+                    emit_proj(p);
+                }
+            } else {
+                emit_proj(p0);
+            }
             {
                 std::lock_guard<std::mutex> lk(io_mtx_);
                 batch_njobs_ = jobs_.size();
@@ -1471,13 +1516,13 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
             }
             io_cv_.notify_all();
             published = true;
-            // Wave two: commit the remaining projections' pages, then append their jobs. A commit
+            // Wave two: commit the deferred projections' pages, then append their jobs. A commit
             // failure here is after wave one published, so waiters may already be blocked on
             // flags this batch will now never flip — go fatal and wake them to observe it.
             for (int e : staged_) {
                 if (!seen_[e]) continue;
                 for (int p = 0; p < MoeRecipe::max_exps; ++p) {
-                    if (p == p0) continue;
+                    if (staggered ? p != down_p : p == p0) continue;
                     if (!commit_proj_pages(il, e, p)) {
                         fatal_.store(true, std::memory_order_release);
                         {
@@ -1490,8 +1535,10 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
             }
             {
                 std::lock_guard<std::mutex> lk(io_mtx_);
-                for (int p = 0; p < MoeRecipe::max_exps; ++p)
-                    if (p != p0) emit_proj(p);
+                for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                    if (staggered ? p != down_p : p == p0) continue;
+                    emit_proj(p);
+                }
                 batch_njobs_ = jobs_.size();
             }
             io_cv_.notify_all();
