@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.33.0] - 2026-09-20
+
+### Added
+- **Custom Jinja chat template (`--chat-template`, `--chat-template-file`).** The chat
+  template was always the model's own (`tokenizer.chat_template` in the gguf): the engine
+  called `common_chat_templates_init(model, "")` with an empty override. Both `bmoe-cli` and
+  `bmoe-server` now take an inline template (`--chat-template "<jinja>"`) or a path read at
+  parse time (`--chat-template-file PATH`), passed to that same override argument. A
+  non-empty value replaces the embedded template outright (llama.cpp semantics: the override
+  is not merged with the model's template), so a model whose embedded template lacks a
+  channel the caller needs, or one that wants a bespoke system preamble, can be driven
+  without editing the gguf. The template is applied only when chatml is on (`bmoe-cli
+  --chatml`; the server forces it). An unreadable `--chat-template-file` path fails fast with
+  exit code 2. Verified live: a custom template injecting a system directive flipped the
+  answer for "What is the capital of France?" from `Paris is the capital of France.` (default
+  template) to `PINEAPPLE` (override), and the thinking-off probe adapts to the loaded
+  template. Gates 16/16.
+
 ## [0.32.0] - 2026-09-13
 
 ### Added

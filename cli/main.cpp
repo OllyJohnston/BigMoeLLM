@@ -22,7 +22,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -34,6 +36,14 @@ using namespace bmoe;
 static int env_int(const char * k, int dflt) {
     const char * v = std::getenv(k);
     return (v && *v) ? std::atoi(v) : dflt;
+}
+
+// Read a whole file as text; used for --chat-template-file. Returns false on open failure.
+static bool read_text_file(const char * path, std::string & out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return true;
 }
 
 static std::string json_escape(const std::string & s) {
@@ -375,6 +385,8 @@ static void print_usage(const char * argv0) {
         "                          decode is unaffected. Measured: a context of 2048 reserves\n"
         "                          320 MiB, falling to 80 MiB at 512.\n"
         "      --chatml            wrap the prompt in the model family's chat turn (gemma/chatml)\n"
+        "      --chat-template S   custom Jinja chat template (default: the gguf's own template)\n"
+        "      --chat-template-file PATH  read the Jinja chat template from a file\n"
         "      --no-think          render the chat template with reasoning disabled\n"
         "      --progress          emit machine telemetry (one JSON line per token)\n"
         "      --session           keep the model loaded and serve JSON prompt requests from stdin\n"
@@ -710,6 +722,15 @@ int main(int argc, char ** argv) {
         }
         else if (a == "--chatml")
             cfg.chatml = true;
+        else if (a == "--chat-template")
+            cfg.chat_template = next("--chat-template");
+        else if (a == "--chat-template-file") {
+            const std::string path = next("--chat-template-file");
+            if (!read_text_file(path.c_str(), cfg.chat_template)) {
+                fprintf(stderr, "bmoe: cannot read --chat-template-file '%s'\n", path.c_str());
+                return 2;
+            }
+        }
         else if (a == "--no-think")
             cfg.think = false;
         else if (a == "--progress")

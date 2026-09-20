@@ -55,6 +55,9 @@ struct SessionConfig {
     // See RunConfig::n_ubatch.
     int n_ubatch = 0;
     bool chatml = false;
+    // Custom Jinja chat template overriding the model's embedded one. Empty = use the gguf's.
+    // See RunConfig::chat_template.
+    std::string chat_template;
     // Active-expert (top-k) override applied at load via a kv_override on the arch-prefixed
     // expert_used_count key. 0 = use the model's own count. See RunConfig::n_expert_used.
     int n_expert_used = 0;

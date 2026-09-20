@@ -391,6 +391,11 @@ struct RunConfig {
     // prefill throughput, which processes a long prompt in more, smaller passes.
     int n_ubatch = 0;
     bool chatml = false;   // wrap the prompt in the model family's chat turn (arch-aware)
+    // Override the model's embedded chat template (tokenizer.chat_template) with custom Jinja.
+    // Empty (the default) uses the template from the gguf. Set from --chat-template (inline) or
+    // --chat-template-file (read at parse time). Only meaningful with chatml; a non-empty value
+    // replaces the embedded template outright rather than merging with it.
+    std::string chat_template;
     bool progress = false; // emit machine telemetry (one JSON line per token)
 
     // Render the chat template with reasoning enabled. Passed to the template as the

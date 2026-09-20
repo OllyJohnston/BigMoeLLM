@@ -767,7 +767,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     // Chat templates are model-bound: initialise once here, apply per prompt in generate().
     if (cfg.chatml) {
         try {
-            im.chat_tmpls = common_chat_templates_init(model, "");
+            im.chat_tmpls = common_chat_templates_init(model, cfg.chat_template);
             im.chat_on = true;
             // Which "thinking off" mechanism this template supports is a property of the model, so
             // it is settled once here rather than re-derived on every turn.

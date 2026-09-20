@@ -34,6 +34,8 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -62,6 +64,15 @@ using socket_t = int;
 using namespace bmoe;
 
 // ── Socket helpers ───────────────────────────────────────────────────────────
+
+
+// Read a whole file as text; used for --chat-template-file. Returns false on open failure.
+static bool read_text_file(const char * path, std::string & out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return true;
+}
 
 
 // ── JSON helpers ─────────────────────────────────────────────────────────────
@@ -855,8 +866,10 @@ static void print_usage(const char * argv0) {
                 "  --temp, --top-k, --top-p, --seed,\n"
                 "  --mtp, --ngram, --draft, --mtp-p-min, --spec-mtp-cr-depth, --spec-draft-adaptive, --ngram-min-match,\n"
                 "  --model-draft FILE, --n-gpu-layers-draft N, --spec-type draft-mtp|draft,\n"
-                "  --n-expert-used, --load-all\n"
-                "  --no-think           disable model thinking\n"
+  "  --n-expert-used, --load-all\n"
+  "  --chat-template S       custom Jinja chat template (default: the gguf's own template)\n"
+  "  --chat-template-file PATH  read the Jinja chat template from a file\n"
+  "  --no-think           disable model thinking\n"
                 "\n"
                 "  -h, --help              show this text and exit\n"
                 "      --version           print the engine version and exit\n"
@@ -1048,6 +1061,15 @@ int main(int argc, char ** argv) {
         else if (a == "--no-think") {
             cfg.think = false;
             srv.disable_think = true;
+        }
+        else if (a == "--chat-template")
+            cfg.chat_template = next("--chat-template");
+        else if (a == "--chat-template-file") {
+            const std::string path = next("--chat-template-file");
+            if (!read_text_file(path.c_str(), cfg.chat_template)) {
+                std::fprintf(stderr, "bmoe-server: cannot read --chat-template-file '%s'\n", path.c_str());
+                return 2;
+            }
         }
 
         // --chat is now always enabled (chat template applied to messages)

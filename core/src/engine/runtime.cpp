@@ -17,6 +17,7 @@ SessionConfig session_config_from(const RunConfig & cfg) {
     sc.n_ubatch = cfg.n_ubatch; // 0 = follow n_batch; smaller trades prefill speed for memory
 
     sc.chatml = cfg.chatml;
+    sc.chat_template = cfg.chat_template; // override for the model's embedded chat template
     sc.n_expert_used = cfg.n_expert_used; // active-expert (top-k) override; 0 = model default
     sc.compute_trace_layers = cfg.compute_trace_layers;
     sc.sampling = cfg.sampling; // greedy by default; opt-in stochastic decoding
