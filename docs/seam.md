@@ -243,7 +243,7 @@ If a future release moves the two hooks (a stable expert-residency API, say) ups
 this seam shrinks further or disappears — `core/` does not change.
 
 Pinned submodule at the time of writing: `OllyJohnston/llama.cpp` branch
-`bmoe/expert-ready-hook`, commit `2f598a90` - the expert-ready hook (section 3) plus the
+`bmoe/expert-ready-hook`, commit `0d200424f` - the expert-ready hook (section 3) plus the
 follow-on work described above, on top of upstream `ggml-org/llama.cpp` master (base
 `b10680`, carrying the merged Qwen3.8-Flash-Next support), extended with the multi-token MoE
 fusion port (PR #27621 minus SWIGLU_CLAMP; see CHANGELOG 0.24.0), the MTP compact-rollback /
@@ -264,7 +264,13 @@ and the Hadamard `k_rot` buffer guard (PR #27967) for context shift with unquant
 caches. The current bump adds the block-granular adaptive KV streaming port (see CHANGELOG
 0.30.0), gated to `qwen35` dense models: `--kv-stream-stage-mib` stages K/V pages through a
 host pool into a device ring on a dedicated copy stream inside the graph-capture path, so
-130k context decodes on a 16 GB GPU without WDDM paging. The branch is pushed to the public
+130k context decodes on a 16 GB GPU without WDDM paging. The latest commit carries the GDN
+q/k normalization correctness fix (PR #28068; see CHANGELOG 0.33.1): every GDN call site used
+`ggml_l2_norm`, `x / max(sqrt(sum(x*x)), eps)` (torch `normalize`), where the flash-linear-attention
+reference is `x * rsqrt(sum(x*x) + eps)` with eps inside the root, so llama.cpp normalised with no
+epsilon at all; the new `build_gdn_l2_norm` expresses the reference form as `rms_norm(x, eps/n) *
+(1/sqrt(n))`. Affects qwen35, qwen35moe, qwen3next, qwen4exp, bailingmoe3, kimi-k3 and kimi-linear.
+The branch is pushed to the public
 `OllyJohnston/llama.cpp` fork, so the pin is reachable for any
 clone of this repo. Each bump gets its own fork branch and the previous ones stay, so every
 commit an old pin names remains reachable (see `.gitmodules` / `git submodule status` for the

@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.33.1] - 2026-09-24
+
+### Fixed
+- **GDN q/k normalization now matches the flash-linear-attention reference (PR #28068).**
+  Every gated-delta-net call site normalised q/k with `ggml_l2_norm`, that is
+  `x / max(sqrt(sum(x*x)), eps)` (torch `nn.functional.normalize`, with eps as a clamp outside
+  the root). The reference is `x * rsqrt(sum(x*x) + eps)`, with eps inside the root. At these
+  magnitudes the clamp never engages, so the engine normalised with no epsilon at all where the
+  reference has one. `build_gdn_l2_norm` now expresses the reference form as
+  `rms_norm(x, eps/n) * (1/sqrt(n))` (no new ggml op; `ggml_l2_norm` itself is unchanged and
+  still correct for its rwkv7 caller). Affects Qwen3.5 (dense 27B), Qwen3.5-MoE (35B-A3B),
+  Qwen3-Next, Qwen3.8-Flash-Next, BailingMoE3, Kimi-K3 and Kimi-Linear. Gates 16/16.
+
 ## [0.33.0] - 2026-09-20
 
 ### Added
