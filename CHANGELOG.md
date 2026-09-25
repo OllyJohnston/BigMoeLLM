@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.33.2] - 2026-09-25
+
+### Fixed
+- **Speculative decoding no longer leaves rejected draft tokens in the KV cache.** The verify
+  decode writes `1 + n_draft` positions but only `1 + n_acc` are confirmed, and the next batch
+  starts at `n_past`; the code that removed the rejected tail was gated on the MTP draft context,
+  so an n-gram session never trimmed. A rejection followed by another drafting step then left the
+  KV ahead of the batch start and llama.cpp refused the decode with a monotonic-position error
+  (`M-RoPE ... X < Y`, `llama_decode: failed to decode, ret = -1`). The trim now runs for any
+  speculative source; only the Compact Rollback checkpoint stays MTP-specific, because the n-gram
+  source carries no draft-side recurrent state and validates `cr_depth == -1`. Reproduced on the
+  Swift-1.5-Qwen3.8-27B n-gram profile: the same prompt and seed failed before the change and
+  completes 300/300 tokens with 27 rejected drafts rolled back after it. Gates 16/16.
+
 ## [0.33.1] - 2026-09-24
 
 ### Fixed

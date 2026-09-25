@@ -1871,16 +1871,18 @@ RunResult Session::generate(const GenerateRequest & req,
             }
             im.mtp_draft_seconds += draft_s;
 
-            // Drop the rejected tail from the target. The bounded-rollback snapshots asked for at
-            // context creation handle the shallow case natively; a deep rejection that outruns
-            // them restores the Compact Rollback checkpoint and replays the accepted prefix in one
-            // extra decode. The draft context is already caught up (above), so it holds the
-            // accepted prefix and needs nothing. MTP only: the n-gram source never takes a
-            // checkpoint (no draft-side recurrent state), and its cr_depth is -1 by validation.
-            if (mtp_on && n_acc < n_draft) {
+            // Drop the rejected tail from the target. This runs for ANY source: the verify decode
+            // wrote 1 + n_draft positions but only 1 + n_acc are confirmed, and the next batch starts
+            // at n_past, so leaving the rejected rows behind puts the KV ahead of the batch and trips
+            // llama.cpp's monotonic position check (M-RoPE X < Y). The bounded-rollback snapshots
+            // asked for at context creation handle the shallow case natively; a rejection deep enough
+            // to outrun them restores the Compact Rollback checkpoint and replays the accepted prefix.
+            // Only the checkpoint belongs to MTP: the n-gram source has no draft-side recurrent state
+            // and never takes one (its cr_depth is -1 by validation), so it always trims.
+            if (spec_on && n_acc < n_draft) {
                 const llama_pos n_rollback = n_draft - n_acc;
                 const llama_pos n_rs = (llama_pos) llama_n_rs_seq(ctx);
-                if (n_rollback > n_rs) {
+                if (mtp_on && n_rollback > n_rs) {
                     // deep rejection: restores the checkpoint, replays the accepted prefix
                     im.cr_ckpt.load_tgt(ctx, /*seq*/ 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                     const auto r0 = clock_t_::now();
