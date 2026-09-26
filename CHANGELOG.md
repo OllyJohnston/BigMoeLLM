@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.36.0] - 2026-09-26
+
+### Added
+- **`--moe-vram-arena`: stream and compute the MoE experts on CUDA.** By default
+  expert streaming reads each routed expert from flash into host memory and the
+  CPU runs the expert matmul. This flag instead binds the streamed expert set to
+  the device and stages each routed layer into a fixed 4-slot CUDA VRAM arena
+  (one slot per projection ring) so the `MUL_MAT_ID` runs on the GPU. It is the
+  counterpart to `--n-pinned-layers` / `--n-cpu-moe`: those anchor *which* layers
+  are device-resident; this flag decides *where the streamed remainder computes*.
+  Measured on Qwen3.8-Flash-Next (48 MoE layers, 512 experts, 10 active) at
+  `-c 32768`, `--n-pinned-layers 8`: decode 1.49 -> 3.88 tok/s (+2.6x), with the
+  per-token compute dropping 0.477 -> 0.199 s and host reads 97.7 -> 8.3 MiB/token.
+  Required with MoE streaming (`--moe-stream`); rejected otherwise.
+
+### Fixed
+- **Slice-granular VRAM staging.** The arena's coalesced transfer copied
+  `[0, max_end)` of the bounce buffer, which for a 512-expert layer is the whole
+  ~1.1 GiB layer - every gap between the routed experts included - so 48 layers
+  pushed ~53 GB/token across PCIe and the arena path ran *slower* than CPU
+  compute (0.46 tok/s). Each staged slice is now copied to its own offset in the
+  slot, so only the routed experts cross the bus. The fixed 4-slot arena is kept
+  unchanged, preserving the ids indexing and the single-graph-split invariant.
+- **`cache auto` reporting when host RAM is exhausted.** The dense-weight
+  deduction is capped at the available figure, so a dense set larger than free
+  RAM saturated it to exactly zero - indistinguishable from a failed query - and
+  the engine reported "available memory unknown". It now distinguishes the two
+  and points at an explicit `--cache-mb` override.
+
 ## [0.35.0] - 2026-09-26
 
 ### Changed

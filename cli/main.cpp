@@ -466,6 +466,10 @@ static void print_usage(const char * argv0) {
         "      --cache-ceil-mb N   with --cache-mb auto: upper bound on the budget (0 = no cap)\n"
         "      --io-threads N      parallel expert-read lanes [1..%d] (default 4)\n"
         "      --no-odirect        do not bypass the page cache for expert reads\n"
+        "      --moe-vram-arena    bind the streamed MoE experts to the CUDA VRAM staging arena so\n"
+        "                          their GEMM runs on CUDA instead of CPU workers (opt-in; needs\n"
+        "                          --moe-stream; costs a few GB of VRAM, lower --n-pinned-layers\n"
+        "                          if the reserve fails)\n"
         "      --dense-weights M   dense (non-expert) weight policy: mmap | warm | anon (default) | ahwb\n"
         "                          (warm = page-cache them at load, best when the model fits in RAM;\n"
         "                          anon = read via O_DIRECT into our own buffers and rebind, so a\n"
@@ -783,6 +787,8 @@ int main(int argc, char ** argv) {
             cfg.moe.io_threads = std::atoi(next("--io-threads"));
         else if (a == "--no-odirect")
             cfg.moe.o_direct = false;
+        else if (a == "--moe-vram-arena")
+            cfg.moe.vram_arena = true;
         else if (a == "--n-pinned-layers" || a == "--pinned-layers") {
             cfg.moe.n_pinned_layers = std::atoi(next(a.c_str()));
             n_pinned_set = true;

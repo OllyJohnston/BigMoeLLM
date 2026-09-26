@@ -111,8 +111,14 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
             }
         }
         if (avail == 0) {
+            // 0 means "no host RAM left after the dense reservation" (or a failed query). The
+            // dense deduction above is capped at avail, so a dense set larger than free RAM
+            // saturates it to exactly 0 - a real result, not an error. Report it distinctly and
+            // point at the override, since the floor is then the only budget the cache can get.
             cache_max_ = min_budget;
-            std::fprintf(stderr, "bmoe: cache auto — available memory unknown, using the %zu MiB floor\n",
+            std::fprintf(stderr,
+                         "bmoe: cache auto — no host RAM left after the dense reservation (or the "
+                         "query failed); using the %zu MiB floor (pass an explicit --cache-mb to override)\n",
                          min_budget / (1024 * 1024));
         } else {
             size_t budget = avail > floor ? (size_t) (avail - floor) : 0;
@@ -160,6 +166,13 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
     }
     if (pinned_device_resident) {
         cuda_stager_.set_cpu_layer_range(cpu_lo, cpu_hi);
+    } else if (cfg.vram_arena) {
+        // --moe-vram-arena: the placement was chosen in session.cpp (the streamed set is bound
+        // to the device arena path), so arm the range and the staging path directly. Without
+        // this, arming depends on the buffer the override already produced - the circularity
+        // that kept --cpu-moe on CPU workers.
+        cuda_stager_.set_cpu_layer_range(cpu_lo, cpu_hi);
+        cuda_staging_enabled_ = true;
     }
     for (int il = 0; il < (int) layers_.size(); ++il) {
         const LayerExperts & L = layers_[il];
@@ -202,8 +215,9 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         const int n_slots = 4;
         size_t arena_sz = slot_cap * (size_t) n_slots;
         cuda_stager_.init(arena_sz, n_slots);
-        std::fprintf(stderr, "bmoe: dual-stream CUDA VRAM staging enabled (%zu MiB arena, %d slots of %zu MiB)\n",
-                     arena_sz / (1024 * 1024), n_slots, slot_cap / (1024 * 1024));
+        std::fprintf(stderr, "bmoe: dual-stream CUDA VRAM staging enabled (%zu MiB arena, %d slots of %zu MiB)%s\n",
+                     arena_sz / (1024 * 1024), n_slots, slot_cap / (1024 * 1024),
+                     cfg.vram_arena ? " [--moe-vram-arena: streamed experts compute on CUDA]" : "");
     }
 #endif
 

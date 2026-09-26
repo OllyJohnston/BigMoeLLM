@@ -123,11 +123,15 @@ public:
         cpu_set_active_ = true;
         n_pinned_ = (hi < 0) ? lo : 0; // legacy prefix count; only meaningful for the prefix anchor
         if (hi < 0) {
-            std::fprintf(stderr, "bmoe: hybrid static offload enabled — %d early MoE layers pinned permanently in VRAM\n",
-                         lo);
+            std::fprintf(stderr,
+                         "bmoe: hybrid static offload - --n-pinned-layers %d: layers 0..%d device-resident,"
+                         " the rest streamed on the CPU\n",
+                         lo, lo - 1);
         } else {
-            std::fprintf(stderr, "bmoe: hybrid static offload enabled — first %d MoE layers compute on the CPU, the rest stay in VRAM\n",
-                         hi);
+            std::fprintf(stderr,
+                         "bmoe: hybrid static offload - --n-cpu-moe %d: layers 0..%d compute on the CPU,"
+                         " the rest device-resident\n",
+                         hi, hi - 1);
         }
     }
 
@@ -214,11 +218,19 @@ public:
                     max_end = aligned_offset + item.size;
                 }
             }
-            if (max_end > 0) {
-                cudaError_t err = cudaMemcpyAsync(slot->d_ptr, pinned_hbuf_, max_end,
-                                                  cudaMemcpyHostToDevice, stream_mgr_.transfer_stream());
+            // Scatter only the staged slices into their natural layer offsets in the slot. The
+            // bounce buffer mirrors the full layer layout, but copying [0, max_end) would DMA
+            // every gap between the routed experts too - for a 512-expert layer that is the whole
+            // ~1.1 GiB layer across PCIe per step (~53 GiB/token over 48 layers), which is what
+            // made the arena path slower than CPU compute. Copy each item's own range instead.
+            for (const auto & item : items) {
+                size_t aligned_offset = (item.offset_in_slot + 255ull) & ~255ull;
+                cudaError_t err = cudaMemcpyAsync((char *) slot->d_ptr + aligned_offset,
+                                                  (const char *) pinned_hbuf_ + aligned_offset,
+                                                  item.size, cudaMemcpyHostToDevice,
+                                                  stream_mgr_.transfer_stream());
                 if (err != cudaSuccess) {
-                    std::fprintf(stderr, "bmoe: coalesced cudaMemcpyAsync failed for layer %d (error %d)\n",
+                    std::fprintf(stderr, "bmoe: scatter cudaMemcpyAsync failed for layer %d (error %d)\n",
                                  layer_idx, (int) err);
                     return false;
                 }

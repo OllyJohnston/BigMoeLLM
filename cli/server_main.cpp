@@ -863,8 +863,11 @@ static void print_usage(const char * argv0) {
   "  --n-cpu-moe N/-ncmoe    keep the first N layers' MoE expert weights on the CPU, the rest\n"
   "                          device-resident (llama.cpp / LM Studio semantics; implies --cpu-moe)\n"
   "  --n-pinned-layers N     the opposite anchor: first N MoE layers device-resident, rest on CPU\n"
+  "  --moe-vram-arena        bind the streamed MoE experts to the CUDA VRAM staging arena so\n"
+  "                          their GEMM runs on CUDA instead of CPU workers (opt-in; needs\n"
+  "                          --moe-stream; costs a few GB of VRAM)\n"
                 "  --ubatch, --batch-size, --moe-stream, --cache-mb, --cache-floor-mb, --cache-ceil-mb,\n"
-                "  --io-threads, --no-odirect, --dense-weights,\n"
+                "  --io-threads, --no-odirect, --dense-weights, --moe-vram-arena,\n"
                 "  --prefetch, --predict-prefetch, --drop-cold-experts,\n"
                 "  --overlap, --io-two-wave, --route-ahead,\n"
                 "  --temp, --top-k, --top-p, --seed,\n"
@@ -1104,6 +1107,8 @@ int main(int argc, char ** argv) {
             cfg.moe.io_threads = std::atoi(next("--io-threads"));
         else if (a == "--no-odirect")
             cfg.moe.o_direct = false;
+        else if (a == "--moe-vram-arena")
+            cfg.moe.vram_arena = true;
         else if (a == "--n-pinned-layers" || a == "--pinned-layers") {
             cfg.moe.n_pinned_layers = std::atoi(next(a.c_str()));
             n_pinned_set = true;
