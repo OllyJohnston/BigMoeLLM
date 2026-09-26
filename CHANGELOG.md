@@ -4,7 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
-## [0.33.2] - 2026-09-25
+## [0.34.0] - 2026-09-26
+
+### Added
+- **`--n-cpu-moe N` / `-ncmoe`: keep the first N layers' MoE expert weights on the CPU.** This is
+  llama.cpp's and LM Studio's MoE placement control. The flag already existed but **silently
+  ignored its argument** and behaved as `--cpu-moe` (every expert on the CPU), which is why the
+  parameter appeared to be missing. The engine now honours the count: layers `0..N-1` route to
+  the CPU and the rest stay device-resident, matching LM Studio's "Number of layers to force MoE
+  weights onto CPU" slider position for position.
+- **`-cmoe` short alias for `--cpu-moe`, and `-ncmoe` for `--n-cpu-moe`.** `--n-cpu-moe` implies
+  `--cpu-moe`, so it works standalone (pure hybrid static offload) or with `--moe-stream`.
+
+### Changed
+- The MoE CPU/GPU split is now carried as an explicit CPU layer range, making both anchors
+  first-class: `--n-pinned-layers P` keeps the first P layers **device-resident** (GPU prefix,
+  CPU suffix), while `--n-cpu-moe N` keeps the first N layers on the **CPU** (CPU prefix, GPU
+  suffix). They anchor the same split at opposite ends, so the CLIs now reject giving both
+  (exit 2) rather than silently honouring one. `--n-pinned-layers` keeps its meaning and remains
+  the default anchor (16), so no existing invocation changes behaviour.
+
+### Fixed
+- **`--n-cpu-moe` no longer swallows the layer count.** Previously `--n-cpu-moe 28` set
+  `--cpu-moe` and left `28` to be parsed as an unknown argument; the count is now consumed and
+  applied.
+
+
 
 ### Fixed
 - **Speculative decoding no longer leaves rejected draft tokens in the KV cache.** The verify

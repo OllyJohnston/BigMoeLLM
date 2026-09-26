@@ -454,6 +454,13 @@ static void print_usage(const char * argv0) {
         "\n"
         "  MoE expert streaming:\n"
         "      --moe-stream        stream only the routed experts per token (MoE models)\n"
+        "      -cmoe, --cpu-moe    keep ALL MoE expert weights on the CPU (hybrid static offload)\n"
+        "      -ncmoe, --n-cpu-moe N  keep the MoE expert weights of the first N layers on the CPU,\n"
+        "                          leaving the rest device-resident. Matches llama.cpp / LM Studio;\n"
+        "                          implies --cpu-moe. Anchored at the opposite end to\n"
+        "                          --n-pinned-layers, so the two are mutually exclusive\n"
+        "      --n-pinned-layers N  keep the first N MoE layers device-resident and the rest on the\n"
+        "                          CPU (the opposite anchor; default %d)\n"
         "      --cache-mb N|auto   LRU expert cache budget in MiB (0=off, or >=%d); auto=size to device\n"
         "      --cache-floor-mb N  with --cache-mb auto: RAM to leave free (default 1536)\n"
         "      --cache-ceil-mb N   with --cache-mb auto: upper bound on the budget (0 = no cap)\n"
@@ -570,6 +577,8 @@ static void print_predict_report(const RunSummary & s) {
 
 int main(int argc, char ** argv) {
     RunConfig cfg;
+    bool n_cpu_moe_set = false; // both MoE placement anchors given -> mutually exclusive
+    bool n_pinned_set = false;
     std::string csv_path;
     std::string route_trace_path;
     std::string compute_trace_path;
@@ -637,11 +646,20 @@ int main(int argc, char ** argv) {
             cfg.sampling.frequency_penalty = (float) std::atof(next(a.c_str()));
         else if (a == "--repeat-last-n" || a == "--penalty-last-n")
             cfg.sampling.repeat_last_n = std::atoi(next(a.c_str()));
-        else if (a == "--cpu-moe")
+        else if (a == "--cpu-moe" || a == "-cmoe")
             cfg.moe.cpu_moe = true;
-        else if (a == "--n-cpu-moe") {
+        else if (a == "--n-cpu-moe" || a == "-ncmoe") {
+            // llama.cpp / LM Studio semantics: keep the MoE expert weights of the first N layers
+            // on the CPU, the rest device-resident. Implies --cpu-moe for the host buft path
+            // (the flag is otherwise about which end of the layer range is anchored to the CPU).
             cfg.moe.cpu_moe = true;
-            // e.g. --n-cpu-moe 28
+            cfg.moe.n_cpu_moe = std::atoi(next(a.c_str()));
+            n_cpu_moe_set = true;
+            if (n_pinned_set) {
+                std::fprintf(stderr, "bmoe: --n-cpu-moe and --n-pinned-layers anchor the MoE split at "
+                                     "opposite ends; choose one.\n");
+                return 2;
+            }
         } else if (a == "--load-mode") {
             std::string lm = next("--load-mode");
             if (lm == "mmap") {
@@ -765,8 +783,15 @@ int main(int argc, char ** argv) {
             cfg.moe.io_threads = std::atoi(next("--io-threads"));
         else if (a == "--no-odirect")
             cfg.moe.o_direct = false;
-        else if (a == "--n-pinned-layers" || a == "--pinned-layers")
+        else if (a == "--n-pinned-layers" || a == "--pinned-layers") {
             cfg.moe.n_pinned_layers = std::atoi(next(a.c_str()));
+            n_pinned_set = true;
+            if (n_cpu_moe_set) {
+                std::fprintf(stderr, "bmoe: --n-pinned-layers and --n-cpu-moe anchor the MoE split at "
+                                     "opposite ends; choose one.\n");
+                return 2;
+            }
+        }
         else if (a == "--dense-weights") {
 
             const std::string m = next("--dense-weights");

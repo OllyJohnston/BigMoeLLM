@@ -112,16 +112,35 @@ public:
 #endif
     }
 
-    void set_pinned_layers(int n_pinned) {
-        n_pinned_ = n_pinned;
-        if (n_pinned_ > 0) {
+    // The CPU layer set is stored as an explicit range [cpu_lo_, cpu_hi_); the device-resident
+    // ("pinned") set is its complement. Both placement anchors reduce to a range:
+    //   --n-pinned-layers P -> [P, end)   (GPU prefix, CPU suffix)
+    //   --n-cpu-moe K       -> [0, K)     (CPU prefix, GPU suffix)
+    // cpu_hi_ < 0 means "to the last layer". Nothing is pinned until a range is set.
+    void set_cpu_layer_range(int lo, int hi) {
+        cpu_lo_ = lo;
+        cpu_hi_ = hi;
+        cpu_set_active_ = true;
+        n_pinned_ = (hi < 0) ? lo : 0; // legacy prefix count; only meaningful for the prefix anchor
+        if (hi < 0) {
             std::fprintf(stderr, "bmoe: hybrid static offload enabled — %d early MoE layers pinned permanently in VRAM\n",
-                         n_pinned_);
+                         lo);
+        } else {
+            std::fprintf(stderr, "bmoe: hybrid static offload enabled — first %d MoE layers compute on the CPU, the rest stay in VRAM\n",
+                         hi);
         }
     }
 
+    // llama.cpp --n-cpu-moe semantics: the first n layers' MoE weights on the CPU.
+    void set_cpu_moe_layers(int n) { set_cpu_layer_range(0, n); }
+
+    // Legacy prefix anchor: the first n layers' MoE weights device-resident.
+    void set_pinned_layers(int n) { set_cpu_layer_range(n, -1); }
+
     bool is_layer_pinned(int layer_idx) const {
-        return layer_idx >= 0 && layer_idx < n_pinned_;
+        if (!cpu_set_active_ || layer_idx < 0) return false;
+        const bool in_cpu = layer_idx >= cpu_lo_ && (cpu_hi_ < 0 || layer_idx < cpu_hi_);
+        return !in_cpu;
     }
 
     void * pinned_layer_ptr(int layer_idx) const {
@@ -389,6 +408,10 @@ private:
 
     bool inited_ = false;
     int n_pinned_ = 0;
+    // CPU layer set [cpu_lo_, cpu_hi_) (cpu_hi_ < 0 = to the last layer); inactive until set.
+    bool cpu_set_active_ = false;
+    int cpu_lo_ = 0;
+    int cpu_hi_ = -1;
     size_t slot_capacity_ = 0;
     void * pinned_hbuf_ = nullptr;
     size_t pinned_hbuf_cap_ = 0;

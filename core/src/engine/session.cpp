@@ -644,14 +644,22 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         buft_overrides.push_back({ ".*token_embd_ngram.*", ggml_backend_cpu_buffer_type() });
 
         if (cfg.moe.enabled || cfg.moe.cpu_moe) {
-            const int n_pinned = cfg.moe.n_pinned_layers;
+            // CPU layer set [cpu_lo, cpu_end), cpu_hi < 0 = to the last layer. Both placement
+            // anchors reduce to it, and the device-resident ("pinned") set is the complement:
+            //   --n-cpu-moe K       -> [0, K)   first K layers' MoE on the CPU (llama.cpp /
+            //                                   LM Studio semantics), the rest device-resident
+            //   --n-pinned-layers P -> [P, end) first P layers' MoE device-resident
+            const bool cpu_moe_count = cfg.moe.n_cpu_moe >= 0;
+            const int cpu_lo = cpu_moe_count ? 0 : cfg.moe.n_pinned_layers;
+            const int cpu_hi = cpu_moe_count ? cfg.moe.n_cpu_moe : -1;
+            const int cpu_end = (cpu_hi < 0 || cpu_hi > 256) ? 256 : cpu_hi;
             // The n-gram / PLE tables must stay host-resident (they are huge and the streamer
             // mmaps them); no_host prevents the loader's CPU-override from being rerouted onto a
             // driver-pinned CUDA_Host buffer, keeping them on plain CPU buft (see below).
             if (cfg.moe.cpu_moe) {
-                // --cpu-moe hybrid (BMOE-SCHED-01): layers 0..n_pinned-1 stay on the CUDA0 device
-                // buft (no override), so their MoE nodes dispatch to CUDA and decode keeps GPU
-                // throughput; layers n_pinned..255 override to the plain CPU buft and stream from
+                // --cpu-moe hybrid (BMOE-SCHED-01): the device-resident complement stays on the
+                // CUDA0 device buft (no override), so its MoE nodes dispatch to CUDA and decode
+                // throughput; the CPU set overrides to the plain CPU buft and streams from
                 // host. no_host prevents the loader from rerouting the CPU override onto a
                 // cudaMallocHost (CUDA_Host) pin — that committed ~3.7 GB of driver-pinned host
                 // RAM for no benefit and, pre-guard, let the CPU compute path dereference a
@@ -666,7 +674,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
 #else
                 ggml_backend_cpu_buffer_type();
 #endif
-            for (int il = n_pinned; il < 256; ++il) {
+            for (int il = cpu_lo; il < cpu_end; ++il) {
                 buft_override_patterns.push_back("blk\\." + std::to_string(il) + "\\.ffn_.*exps.*");
             }
 

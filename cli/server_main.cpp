@@ -859,6 +859,10 @@ static void print_usage(const char * argv0) {
                 "  -t, --threads, -ngl, --n-gpu-layers, -nkqv, --no-offload-kqv, -c, --ctx-size\n"
   "  --kv-stream-stage-mib N  block-granular KV streaming staging pool in MiB (0 = disabled; Qwen3.5 dense only)\n"
   "  --cuda-nvfp4 MODE       native Blackwell NVFP4 MMA: auto (default; dense Qwen3.5 + sm_120 only), on, off\n"
+  "  --cpu-moe/-cmoe         keep ALL MoE expert weights on the CPU (hybrid static offload)\n"
+  "  --n-cpu-moe N/-ncmoe    keep the first N layers' MoE expert weights on the CPU, the rest\n"
+  "                          device-resident (llama.cpp / LM Studio semantics; implies --cpu-moe)\n"
+  "  --n-pinned-layers N     the opposite anchor: first N MoE layers device-resident, rest on CPU\n"
                 "  --ubatch, --batch-size, --moe-stream, --cache-mb, --cache-floor-mb, --cache-ceil-mb,\n"
                 "  --io-threads, --no-odirect, --dense-weights,\n"
                 "  --prefetch, --predict-prefetch, --drop-cold-experts,\n"
@@ -910,6 +914,8 @@ int main(int argc, char ** argv) {
 #endif
 
     RunConfig cfg;
+    bool n_cpu_moe_set = false; // both MoE placement anchors given -> mutually exclusive
+    bool n_pinned_set = false;
     ServerConfig srv;
     bool n_predict_set = false; // -n/--n-predict explicitly given: feeds the wire fallback
 
@@ -981,10 +987,19 @@ int main(int argc, char ** argv) {
             cfg.sampling.frequency_penalty = (float) std::atof(next(a.c_str()));
         else if (a == "--repeat-last-n" || a == "--penalty-last-n")
             cfg.sampling.repeat_last_n = std::atoi(next(a.c_str()));
-        else if (a == "--cpu-moe")
+        else if (a == "--cpu-moe" || a == "-cmoe")
             cfg.moe.cpu_moe = true;
-        else if (a == "--n-cpu-moe") {
+        else if (a == "--n-cpu-moe" || a == "-ncmoe") {
+            // llama.cpp / LM Studio semantics: keep the MoE expert weights of the first N layers
+            // on the CPU, the rest device-resident. Implies --cpu-moe for the host buft path.
             cfg.moe.cpu_moe = true;
+            cfg.moe.n_cpu_moe = std::atoi(next(a.c_str()));
+            n_cpu_moe_set = true;
+            if (n_pinned_set) {
+                std::fprintf(stderr, "bmoe-server: --n-cpu-moe and --n-pinned-layers anchor the MoE "
+                                     "split at opposite ends; choose one.\n");
+                return 2;
+            }
         } else if (a == "--load-mode") {
             std::string lm = next("--load-mode");
             if (lm == "mmap") {
@@ -1089,8 +1104,15 @@ int main(int argc, char ** argv) {
             cfg.moe.io_threads = std::atoi(next("--io-threads"));
         else if (a == "--no-odirect")
             cfg.moe.o_direct = false;
-        else if (a == "--n-pinned-layers" || a == "--pinned-layers")
+        else if (a == "--n-pinned-layers" || a == "--pinned-layers") {
             cfg.moe.n_pinned_layers = std::atoi(next(a.c_str()));
+            n_pinned_set = true;
+            if (n_cpu_moe_set) {
+                std::fprintf(stderr, "bmoe-server: --n-pinned-layers and --n-cpu-moe anchor the MoE "
+                                     "split at opposite ends; choose one.\n");
+                return 2;
+            }
+        }
         else if (a == "--dense-weights") {
 
             const std::string m = next("--dense-weights");

@@ -95,8 +95,15 @@ struct MoeStreamConfig {
 
     // Number of early MoE layers to statically retain/pin in VRAM (0 = disabled).
     // Layers 0..n_pinned_layers-1 stay permanently resident in CUDA0 VRAM, eliminating PCIe transfers
-    // for the first N layers and matching LM Studio's hybrid split.
+    // for the first N layers. Anchor: the GPU set is the PREFIX, the CPU set is the suffix.
     int n_pinned_layers = 16;
+
+    // llama.cpp / LM Studio "--n-cpu-moe" semantics: keep the MoE expert weights of the FIRST
+    // n_cpu_moe layers in the CPU, leaving the remaining layers device-resident. Anchor: the CPU
+    // set is the PREFIX, the GPU set is the suffix - the opposite end from n_pinned_layers.
+    // -1 (default) selects the n_pinned_layers split above. The two are mutually exclusive;
+    // n_cpu_moe wins when both are set explicitly (the CLI rejects that combination).
+    int n_cpu_moe = -1;
 
     // Hybrid CPU MoE mode: unpinned expert weights mapped statically to system RAM (mmap)
     // Attention/norms and first N layers run on CUDA0; unpinned FFNs compute on 12 CPU threads.

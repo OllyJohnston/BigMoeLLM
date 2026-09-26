@@ -154,6 +154,12 @@ if (cfg.spec.is_ngram() && cfg.spec.cr_depth != -1) {
                     "streamer isolates, and off the streaming path there is nothing to commit to");
     }
 
+    // llama.cpp --n-cpu-moe: only meaningful when the expert weights are streamed or offloaded.
+    if (cfg.moe.n_cpu_moe >= 0 && !cfg.moe.enabled && !cfg.moe.cpu_moe) {
+        return fail("moe.n_cpu_moe requires moe.enabled or moe.cpu_moe: the CPU/GPU expert split "
+                    "only applies when the MoE weights are streamed or offloaded.");
+    }
+
     if (cfg.moe.enabled) {
         const MoeStreamConfig & m = cfg.moe;
         if (m.io_threads < 1 || m.io_threads > MoeStreamConfig::io_threads_max) {

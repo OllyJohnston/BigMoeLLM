@@ -130,30 +130,36 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
 #if defined(BMOE_HAVE_CUDA)
     cuda_staging_enabled_ = false;
     host_pinned_ = false;
-    // BMOE-SCHED-01: "pinned layers" only means something when they sit in a non-host (device)
-    // buffer. In a host-only deployment (-ngl 0, the gates) no layer is device-resident, so
-    // arming the mask would wrongly exempt every layer from streaming AND speculation. Probe the
-    // first n_pinned_layers for a real device buffer; arm the mask only when one exists, then
-    // skip those layers in the scan below so their device buffers never arm the VRAM-arena
-    // staging path for the streamed layers.
-    const int n_pin = cfg.n_pinned_layers > (int) layers_.size() ? (int) layers_.size() : cfg.n_pinned_layers;
+    // BMOE-SCHED-01: "pinned" only means something when the layer's experts sit in a non-host
+    // (device) buffer. Freshly committed device-resident failures were the reason to probe:
+    // in a host-only deployment (-ngl 0, the gates) no layer is device-resident, so arming the
+    // range would wrongly exempt every layer from streaming AND speculation. Probe the
+    // device-resident complement for a real device buffer; arm only when one exists, then skip
+    // those layers in the scan below so their device buffers never arm the VRAM-arena staging
+    // path for the streamed layers.
+    //
+    // Placement anchor (CPU set [cpu_lo, cpu_hi), cpu_hi < 0 = to the last layer):
+    //   --n-cpu-moe K       -> [0, K)   (first K layers on the CPU, the rest device-resident)
+    //   --n-pinned-layers P -> [P, end) (first P layers device-resident, the rest on the CPU)
+    const int n_layers_here = (int) layers_.size();
+    const bool cpu_moe_count = cfg.n_cpu_moe >= 0;
+    const int cpu_lo = cpu_moe_count ? 0 : cfg.n_pinned_layers;
+    const int cpu_hi = cpu_moe_count ? cfg.n_cpu_moe : -1;
     bool pinned_device_resident = false;
-    if (n_pin > 0) {
-        for (int il = 0; il < n_pin; ++il) {
-            const LayerExperts & L = layers_[il];
-            if (!L.bound) continue;
-            for (int p = 0; p < MoeRecipe::max_exps; ++p) {
-                if (!L.proj[p].tensor || !L.proj[p].tensor->buffer) continue;
-                if (!ggml_backend_buffer_is_host(L.proj[p].tensor->buffer)) {
-                    pinned_device_resident = true;
-                    break;
-                }
+    for (int il = 0; il < n_layers_here && !pinned_device_resident; ++il) {
+        if (il >= cpu_lo && (cpu_hi < 0 || il < cpu_hi)) continue; // in the CPU set
+        const LayerExperts & L = layers_[il];
+        if (!L.bound) continue;
+        for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+            if (!L.proj[p].tensor || !L.proj[p].tensor->buffer) continue;
+            if (!ggml_backend_buffer_is_host(L.proj[p].tensor->buffer)) {
+                pinned_device_resident = true;
+                break;
             }
-            if (pinned_device_resident) break;
         }
     }
     if (pinned_device_resident) {
-        cuda_stager_.set_pinned_layers(n_pin);
+        cuda_stager_.set_cpu_layer_range(cpu_lo, cpu_hi);
     }
     for (int il = 0; il < (int) layers_.size(); ++il) {
         const LayerExperts & L = layers_[il];
