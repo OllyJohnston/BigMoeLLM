@@ -243,7 +243,7 @@ If a future release moves the two hooks (a stable expert-residency API, say) ups
 this seam shrinks further or disappears — `core/` does not change.
 
 Pinned submodule at the time of writing: `OllyJohnston/llama.cpp` branch
-`bmoe/expert-ready-hook`, commit `0d200424f` - the expert-ready hook (section 3) plus the
+`bmoe/expert-ready-hook`, commit `43c575bb6` - the expert-ready hook (section 3) plus the
 follow-on work described above, on top of upstream `ggml-org/llama.cpp` master (base
 `b10680`, carrying the merged Qwen3.8-Flash-Next support), extended with the multi-token MoE
 fusion port (PR #27621 minus SWIGLU_CLAMP; see CHANGELOG 0.24.0), the MTP compact-rollback /
@@ -269,7 +269,11 @@ q/k normalization correctness fix (PR #28068; see CHANGELOG 0.33.1): every GDN c
 `ggml_l2_norm`, `x / max(sqrt(sum(x*x)), eps)` (torch `normalize`), where the flash-linear-attention
 reference is `x * rsqrt(sum(x*x) + eps)` with eps inside the root, so llama.cpp normalised with no
 epsilon at all; the new `build_gdn_l2_norm` expresses the reference form as `rms_norm(x, eps/n) *
-(1/sqrt(n))`. Affects qwen35, qwen35moe, qwen3next, qwen4exp, bailingmoe3, kimi-k3 and kimi-linear.
+(1/sqrt(n))`. Affects qwen35, qwen35moe, qwen3next, qwen4exp, bailingmoe3, kimi-k3 and kimi-linear. The latest commit also carries the configurable FlashAttention K/V combination
+port (PR #28079; see CHANGELOG 0.35.0): `GGML_CUDA_FA_QUANTS` selects which K/V kernel
+combinations are compiled, with an f16 fallback for uncompiled ones, replacing the
+all-or-nothing `GGML_CUDA_FA_ALL_QUANTS` switch (which is still defined, and still the
+KV-stream native path trigger, when the list is `all`).
 The branch is pushed to the public
 `OllyJohnston/llama.cpp` fork, so the pin is reachable for any
 clone of this repo. Each bump gets its own fork branch and the previous ones stay, so every

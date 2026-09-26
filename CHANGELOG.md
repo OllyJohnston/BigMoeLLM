@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.35.0] - 2026-09-26
+
+### Changed
+- **Configurable FlashAttention K/V combinations (upstream PR #28079).** The compiled FA
+  kernel set is now selected with `-DGGML_CUDA_FA_QUANTS=<list>` instead of the
+  all-or-nothing `GGML_CUDA_FA_ALL_QUANTS`. A combination with no compiled kernel falls
+  back to the f16 kernel rather than silently taking a slow path; `f16-f16` is always
+  compiled. The local build adds `q4_0`, `q5_0`, `q5_1`, `q8_0` and the mixed
+  `q8_0-q4_0` / `q4_0-q8_0` combinations. Measured on the dense 27B (522-token prompt,
+  `-c 100000 --ubatch 256`): `q5_1-q5_1` 905 tok/s and `q5_0-q5_0` 934 tok/s prefill,
+  both previously unusable because no kernel existed for them; `q8_0-q4_0` rose from
+  186 to 877 tok/s, confirming the earlier "q8_0 K penalty" was an uncompiled
+  combination falling back, not a property of the kernel. `q6_K` has no FA kernel at all
+  and stays on the conversion path. Changing the list requires a rebuild.
+
 ## [0.34.0] - 2026-09-26
 
 ### Added
