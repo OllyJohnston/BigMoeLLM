@@ -668,12 +668,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
                 // to the owning backend, so a CPU worker can never see a device tensor.
                 mparams.no_host = true;
             }
-            // --moe-vram-arena overrides the CPU-buffer placement for the streamed set: bind it
-            // to the device arena path (the dummy CUDA buft marker, which the streamer then
-            // repoints at its VRAM staging arena) so the staging probe arms and MUL_MAT_ID
-            // dispatches to CUDA instead of CPU workers.
-            ggml_backend_buffer_type_t target_buft =
-                (cfg.moe.cpu_moe && !cfg.moe.vram_arena) ? ggml_backend_cpu_buffer_type() :
+            ggml_backend_buffer_type_t target_buft = cfg.moe.cpu_moe ? ggml_backend_cpu_buffer_type() :
 #if defined(BMOE_HAVE_CUDA)
                 get_dummy_cuda_buft();
 #else

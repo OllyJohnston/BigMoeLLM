@@ -109,23 +109,6 @@ struct MoeStreamConfig {
     // Attention/norms and first N layers run on CUDA0; unpinned FFNs compute on 12 CPU threads.
     bool cpu_moe = false;
 
-    // Opt-in (--moe-vram-arena): bind the streamed MoE expert layers to the CUDA VRAM staging
-    // arena (a device buffer) instead of the plain CPU buffer, so their MUL_MAT_ID dispatches
-    // to the CUDA backend and the arena's per-layer staging path fills it.
-    //
-    // Without this, --cpu-moe / --n-cpu-moe route the streamed experts to the plain CPU buffer
-    // (session.cpp), the VRAM-staging probe in expert_stream_source then sees only host buffers,
-    // and every streamed expert GEMM runs on CPU workers - the dominant decode cost on a
-    // multi-billion-active-parameter MoE. The flag decouples that circular probe: the placement
-    // is chosen here (session.cpp binds the set to the device arena path) instead of being
-    // inferred from the buffer the CPU override had already forced.
-    //
-    // The placement is unchanged (the CPU set is still the streaming set); only its compute
-    // buffer moves from host to the device arena. The arena holds one layer at a time (a few
-    // slots of the largest layer, a few GB of VRAM), so lower --n-pinned-layers if the reserve
-    // fails.
-    bool vram_arena = false;
-
     // How the dense (non-expert) weights are treated. The streamer only rebinds experts; the rest —
 
     // gguf header/metadata, embeddings, attention, norms, lm_head — is handled by one of three

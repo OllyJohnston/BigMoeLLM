@@ -160,11 +160,6 @@ if (cfg.spec.is_ngram() && cfg.spec.cr_depth != -1) {
                     "only applies when the MoE weights are streamed or offloaded.");
     }
 
-    if (cfg.moe.vram_arena && !cfg.moe.enabled) {
-        return fail("moe.vram_arena (--moe-vram-arena) requires MoE streaming (--moe-stream): "
-                    "it binds the streamed experts to the CUDA VRAM staging arena.");
-    }
-
     if (cfg.moe.enabled) {
         const MoeStreamConfig & m = cfg.moe;
         if (m.io_threads < 1 || m.io_threads > MoeStreamConfig::io_threads_max) {
